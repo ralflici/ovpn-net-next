@@ -1322,8 +1322,8 @@ int ovpn_nl_key_swap_notify(struct ovpn_peer *peer, u8 key_id)
 	int ret = -EMSGSIZE;
 	void *hdr;
 
-	netdev_info(peer->ovpn->dev, "peer with id %u must rekey - primary key unusable.\n",
-		    peer->id);
+	netdev_info(peer->ovpn->dev, "peer with id %u should rekey key %u\n",
+		    peer->id, key_id);
 
 	msg = nlmsg_new(NLMSG_DEFAULT_SIZE, GFP_ATOMIC);
 	if (!msg)

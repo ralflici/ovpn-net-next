@@ -20,6 +20,7 @@
 #include "pktid.h"
 #include "crypto_aead.h"
 #include "crypto.h"
+#include "netlink.h"
 #include "peer.h"
 #include "proto.h"
 #include "skb.h"
@@ -242,6 +243,8 @@ int ovpn_aead_encrypt(struct ovpn_peer *peer, struct ovpn_crypto_key_slot *ks,
 	ret = ovpn_pktid_xmit_next(&ks->pid_xmit, &pktid);
 	if (unlikely(ret < 0))
 		return ret;
+	if (unlikely(ret > 0))
+		ovpn_nl_key_swap_notify(peer, ks->key_id);
 	ovpn_aead_encrypt_header(peer, ks, pktid, iv, skb->data);
 
 	/* AEAD Additional data */

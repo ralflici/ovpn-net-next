@@ -17,6 +17,9 @@
  */
 #define PKTID_RECV_EXPIRE (30 * HZ)
 
+/* notify userspace when the packet ID space is close to wrapping */
+#define PKTID_XMIT_REKEY_NOTIFY 0xff000000U
+
 /* Packet-ID state for transmitter */
 struct ovpn_pktid_xmit {
 	atomic_t seq_num;
@@ -52,20 +55,36 @@ struct ovpn_pktid_recv {
 	spinlock_t lock;
 };
 
-/* Get the next packet ID for xmit */
+/**
+ * ovpn_pktid_xmit_next - allocate a transmit packet ID
+ * @pid: transmit packet ID state
+ * @pktid: location where the generated packet ID is stored
+ *
+ * The returned packet ID becomes part of the AEAD nonce, so the helper rejects
+ * the packet before the 32-bit packet-ID space wraps.
+ *
+ * The packet-ID soft threshold does not reject the packet. It returns 1 once
+ * so the caller can notify userspace to rekey while packet-ID space remains.
+ *
+ * Return: 1 if userspace should be notified, 0 if no notification is needed,
+ * or a negative error code otherwise.
+ */
 static inline int ovpn_pktid_xmit_next(struct ovpn_pktid_xmit *pid, u32 *pktid)
 {
 	const u32 seq_num = atomic_fetch_add_unless(&pid->seq_num, 1, 0);
-	/* when the 32bit space is over, we return an error because the packet
-	 * ID is used to create the cipher IV and we do not want to reuse the
-	 * same value more than once
-	 */
+	int ret = 0;
+
+	/* packet IDs are used to create cipher IVs and must not wrap */
 	if (unlikely(!seq_num))
 		return -ERANGE;
 
+	/* notify userspace before the packet ID space is close to wrapping */
+	if (unlikely(seq_num == PKTID_XMIT_REKEY_NOTIFY))
+		ret = 1;
+
 	*pktid = seq_num;
 
-	return 0;
+	return ret;
 }
 
 /**
