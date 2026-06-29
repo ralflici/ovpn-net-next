@@ -24,6 +24,6 @@ int ovpn_aead_encrypt_gso(struct ovpn_peer *peer,
 int ovpn_aead_decrypt(struct ovpn_peer *peer, struct ovpn_crypto_key_slot *ks,
 		      struct sk_buff *skb);
 
-bool ovpn_aead_decrypt_failure_record(struct ovpn_crypto_key_slot *ks);
+bool ovpn_aead_decrypt_failure_record(struct ovpn_key_ctx *key);
 
 #endif /* _NET_OVPN_OVPNAEAD_H_ */
