@@ -33,13 +33,20 @@ static const struct netlink_range_validation ovpn_a_keyconf_peer_id_range = {
 };
 
 /* Common nested types */
-const struct nla_policy ovpn_keyconf_nl_policy[OVPN_A_KEYCONF_DECRYPT_DIR + 1] = {
+const struct nla_policy ovpn_epoch_nl_policy[OVPN_A_EPOCH_CIPHER_KEY_LEN + 1] = {
+	[OVPN_A_EPOCH_KEY] = NLA_POLICY_EXACT_LEN(OVPN_EPOCH_PRK_SIZE),
+	[OVPN_A_EPOCH_CIPHER_KEY_LEN] = NLA_POLICY_RANGE(NLA_U32, 1, OVPN_EPOCH_PRK_SIZE),
+};
+
+const struct nla_policy ovpn_keyconf_nl_policy[OVPN_A_KEYCONF_DECRYPT_EPOCH + 1] = {
 	[OVPN_A_KEYCONF_PEER_ID] = NLA_POLICY_FULL_RANGE(NLA_U32, &ovpn_a_keyconf_peer_id_range),
 	[OVPN_A_KEYCONF_SLOT] = NLA_POLICY_MAX(NLA_U32, 1),
 	[OVPN_A_KEYCONF_KEY_ID] = NLA_POLICY_MAX(NLA_U32, 7),
 	[OVPN_A_KEYCONF_CIPHER_ALG] = NLA_POLICY_MAX(NLA_U32, 2),
 	[OVPN_A_KEYCONF_ENCRYPT_DIR] = NLA_POLICY_NESTED(ovpn_keydir_nl_policy),
 	[OVPN_A_KEYCONF_DECRYPT_DIR] = NLA_POLICY_NESTED(ovpn_keydir_nl_policy),
+	[OVPN_A_KEYCONF_ENCRYPT_EPOCH] = NLA_POLICY_NESTED(ovpn_epoch_nl_policy),
+	[OVPN_A_KEYCONF_DECRYPT_EPOCH] = NLA_POLICY_NESTED(ovpn_epoch_nl_policy),
 };
 
 const struct nla_policy ovpn_keyconf_del_input_nl_policy[OVPN_A_KEYCONF_SLOT + 1] = {

@@ -869,6 +869,40 @@ static int ovpn_nl_get_key_dir(struct genl_info *info, struct nlattr *key,
 	return 0;
 }
 
+static int ovpn_nl_get_epoch_key(struct genl_info *info, struct nlattr *key,
+				 enum ovpn_cipher_alg cipher,
+				 struct ovpn_epoch_prk *prk)
+{
+	struct nlattr *attrs[OVPN_A_EPOCH_MAX + 1];
+	int ret;
+
+	ret = nla_parse_nested(attrs, OVPN_A_EPOCH_MAX, key,
+			       ovpn_epoch_nl_policy, info->extack);
+	if (ret)
+		return ret;
+
+	switch (cipher) {
+	case OVPN_CIPHER_ALG_AES_GCM:
+	case OVPN_CIPHER_ALG_CHACHA20_POLY1305:
+		if (NL_REQ_ATTR_CHECK(info->extack, key, attrs,
+				      OVPN_A_EPOCH_KEY) ||
+		    NL_REQ_ATTR_CHECK(info->extack, key, attrs,
+				      OVPN_A_EPOCH_CIPHER_KEY_LEN))
+			return -EINVAL;
+
+		prk->key = nla_data(attrs[OVPN_A_EPOCH_KEY]);
+		prk->key_size = nla_len(attrs[OVPN_A_EPOCH_KEY]);
+		prk->cipher_key_len =
+			nla_get_u32(attrs[OVPN_A_EPOCH_CIPHER_KEY_LEN]);
+		break;
+	default:
+		NL_SET_ERR_MSG_MOD(info->extack, "unsupported cipher");
+		return -EINVAL;
+	}
+
+	return 0;
+}
+
 /**
  * ovpn_nl_key_new_doit - configure a new key for the specified peer
  * @skb: incoming netlink message
@@ -899,6 +933,7 @@ int ovpn_nl_key_new_doit(struct sk_buff *skb, struct genl_info *info)
 	struct nlattr *attrs[OVPN_A_KEYCONF_MAX + 1];
 	struct ovpn_priv *ovpn = info->user_ptr[0];
 	struct ovpn_peer_key_reset pkr = {};
+	bool direct_key, epoch_key;
 	struct ovpn_peer *peer;
 	u32 peer_id;
 	int ret;
@@ -921,28 +956,70 @@ int ovpn_nl_key_new_doit(struct sk_buff *skb, struct genl_info *info)
 	    NL_REQ_ATTR_CHECK(info->extack, info->attrs[OVPN_A_KEYCONF], attrs,
 			      OVPN_A_KEYCONF_KEY_ID) ||
 	    NL_REQ_ATTR_CHECK(info->extack, info->attrs[OVPN_A_KEYCONF], attrs,
-			      OVPN_A_KEYCONF_CIPHER_ALG) ||
-	    NL_REQ_ATTR_CHECK(info->extack, info->attrs[OVPN_A_KEYCONF], attrs,
-			      OVPN_A_KEYCONF_ENCRYPT_DIR) ||
-	    NL_REQ_ATTR_CHECK(info->extack, info->attrs[OVPN_A_KEYCONF], attrs,
-			      OVPN_A_KEYCONF_DECRYPT_DIR))
+			      OVPN_A_KEYCONF_CIPHER_ALG))
 		return -EINVAL;
 
 	pkr.slot = nla_get_u32(attrs[OVPN_A_KEYCONF_SLOT]);
 	pkr.key.key_id = nla_get_u32(attrs[OVPN_A_KEYCONF_KEY_ID]);
 	pkr.key.cipher_alg = nla_get_u32(attrs[OVPN_A_KEYCONF_CIPHER_ALG]);
 
-	ret = ovpn_nl_get_key_dir(info, attrs[OVPN_A_KEYCONF_ENCRYPT_DIR],
-				  pkr.key.cipher_alg,
-				  &pkr.key.direct.encrypt);
-	if (ret < 0)
-		return ret;
+	direct_key = attrs[OVPN_A_KEYCONF_ENCRYPT_DIR] ||
+		     attrs[OVPN_A_KEYCONF_DECRYPT_DIR];
+	epoch_key = attrs[OVPN_A_KEYCONF_ENCRYPT_EPOCH] ||
+		    attrs[OVPN_A_KEYCONF_DECRYPT_EPOCH];
+	if (direct_key == epoch_key) {
+		NL_SET_ERR_MSG_MOD(info->extack,
+				   "specify exactly one key format");
+		return -EINVAL;
+	}
 
-	ret = ovpn_nl_get_key_dir(info, attrs[OVPN_A_KEYCONF_DECRYPT_DIR],
-				  pkr.key.cipher_alg,
-				  &pkr.key.direct.decrypt);
-	if (ret < 0)
-		return ret;
+	if (direct_key) {
+		if (NL_REQ_ATTR_CHECK(info->extack,
+				      info->attrs[OVPN_A_KEYCONF], attrs,
+				      OVPN_A_KEYCONF_ENCRYPT_DIR) ||
+		    NL_REQ_ATTR_CHECK(info->extack,
+				      info->attrs[OVPN_A_KEYCONF], attrs,
+				      OVPN_A_KEYCONF_DECRYPT_DIR))
+			return -EINVAL;
+
+		pkr.key.use_epoch_keys = false;
+		ret = ovpn_nl_get_key_dir(info,
+					  attrs[OVPN_A_KEYCONF_ENCRYPT_DIR],
+					  pkr.key.cipher_alg,
+					  &pkr.key.direct.encrypt);
+		if (ret < 0)
+			return ret;
+
+		ret = ovpn_nl_get_key_dir(info,
+					  attrs[OVPN_A_KEYCONF_DECRYPT_DIR],
+					  pkr.key.cipher_alg,
+					  &pkr.key.direct.decrypt);
+		if (ret < 0)
+			return ret;
+	} else {
+		if (NL_REQ_ATTR_CHECK(info->extack,
+				      info->attrs[OVPN_A_KEYCONF], attrs,
+				      OVPN_A_KEYCONF_ENCRYPT_EPOCH) ||
+		    NL_REQ_ATTR_CHECK(info->extack,
+				      info->attrs[OVPN_A_KEYCONF], attrs,
+				      OVPN_A_KEYCONF_DECRYPT_EPOCH))
+			return -EINVAL;
+
+		pkr.key.use_epoch_keys = true;
+		ret = ovpn_nl_get_epoch_key(info,
+					    attrs[OVPN_A_KEYCONF_ENCRYPT_EPOCH],
+					    pkr.key.cipher_alg,
+					    &pkr.key.epoch.encrypt);
+		if (ret < 0)
+			return ret;
+
+		ret = ovpn_nl_get_epoch_key(info,
+					    attrs[OVPN_A_KEYCONF_DECRYPT_EPOCH],
+					    pkr.key.cipher_alg,
+					    &pkr.key.epoch.decrypt);
+		if (ret < 0)
+			return ret;
+	}
 
 	peer_id = nla_get_u32(attrs[OVPN_A_KEYCONF_PEER_ID]);
 	peer = ovpn_peer_get_by_id(ovpn, peer_id);

@@ -16,7 +16,6 @@
 #include <linux/types.h>
 #include <uapi/linux/ovpn.h>
 
-#define OVPN_EPOCH_PRK_SIZE 32
 #define OVPN_MAX_EPOCH U16_MAX
 #define OVPN_EPOCH_FUTURE_KEYS_COUNT 2
 

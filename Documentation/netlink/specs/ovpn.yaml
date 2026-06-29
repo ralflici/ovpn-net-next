@@ -17,6 +17,10 @@ definitions:
     name: nonce-tail-size
     value: 8
   -
+    type: const
+    name: epoch-prk-size
+    value: 32
+  -
     type: enum
     name: cipher-alg
     entries: [none, aes-gcm, chacha20-poly1305]
@@ -278,6 +282,16 @@ attribute-sets:
         type: nest
         doc: Key material for decrypt direction
         nested-attributes: keydir
+      -
+        name: encrypt-epoch
+        type: nest
+        doc: Epoch PRK material used to derive encrypt data keys
+        nested-attributes: epoch
+      -
+        name: decrypt-epoch
+        type: nest
+        doc: Epoch PRK material used to derive decrypt data keys
+        nested-attributes: epoch
   -
     name: keydir
     attributes:
@@ -295,6 +309,23 @@ attribute-sets:
           obtain the actual cipher IV
         checks:
           exact-len: nonce-tail-size
+  -
+    name: epoch
+    attributes:
+      -
+        name: key
+        type: binary
+        doc: >-
+          The epoch PRK used to derive cipher keys and implicit IVs
+        checks:
+          exact-len: epoch-prk-size
+      -
+        name: cipher-key-len
+        type: u32
+        doc: Length in bytes of the AEAD cipher key derived from the epoch PRK
+        checks:
+          min: 1
+          max: epoch-prk-size
 
   -
     name: keyconf-get
