@@ -178,15 +178,18 @@ int ovpn_aead_encrypt(struct ovpn_peer *peer, struct ovpn_crypto_key_slot *ks,
 		      struct sk_buff *skb)
 {
 	const unsigned int tag_size = crypto_aead_authsize(ks->encrypt);
+	unsigned int plaintext_len;
 	struct aead_request *req;
 	struct sk_buff *trailer;
 	struct scatterlist *sg;
+	bool notify = false;
 	int nfrags, ret;
 	u32 pktid;
 	u8 *iv;
 
 	ovpn_skb_cb(skb)->peer = peer;
 	ovpn_skb_cb(skb)->ks = ks;
+	plaintext_len = skb->len;
 
 	/* Sample AEAD header format:
 	 * 48000001 00000005 7e7046bd 444a7e28 cc6387b1 64a4d6c1 380275a...
@@ -243,7 +246,20 @@ int ovpn_aead_encrypt(struct ovpn_peer *peer, struct ovpn_crypto_key_slot *ks,
 	ret = ovpn_pktid_xmit_next(&ks->pid_xmit, &pktid);
 	if (unlikely(ret < 0))
 		return ret;
-	if (unlikely(ret > 0))
+	notify = ret > 0;
+
+	ret = ovpn_key_usage_xmit(&ks->xmit_usage, &ks->xmit_limit,
+				  ovpn_aead_limit_blocks(ks->cipher_alg,
+							 OVPN_AAD_SIZE,
+							 plaintext_len));
+	if (unlikely(ret < 0))
+		return ret;
+	notify |= ret > 0;
+
+	/* packet-ID space and AEAD usage have independent soft limits;
+	 * notify userspace once when either is crossed
+	 */
+	if (unlikely(notify) && !atomic_xchg(&ks->xmit_rekey_notified, 1))
 		ovpn_nl_key_swap_notify(peer, ks->key_id);
 	ovpn_aead_encrypt_header(peer, ks, pktid, iv, skb->data);
 
@@ -528,6 +544,10 @@ ovpn_aead_crypto_key_slot_new(const struct ovpn_key_config *kc)
 	ks->decrypt = NULL;
 	INIT_WORK(&ks->free_work, ovpn_aead_crypto_key_slot_free_work);
 	ks->key_id = kc->key_id;
+	ks->cipher_alg = kc->cipher_alg;
+	ovpn_key_usage_limit_init(&ks->xmit_limit, kc->cipher_alg);
+	atomic64_set(&ks->xmit_usage, 0);
+	atomic_set(&ks->xmit_rekey_notified, 0);
 
 	ks->encrypt = ovpn_aead_init("encrypt", alg_name,
 				     kc->encrypt.cipher_key,

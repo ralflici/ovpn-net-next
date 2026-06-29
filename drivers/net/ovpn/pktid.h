@@ -10,6 +10,7 @@
 #ifndef _NET_OVPN_OVPNPKTID_H_
 #define _NET_OVPN_OVPNPKTID_H_
 
+#include "crypto_limits.h"
 #include "proto.h"
 
 /* If no packets received for this length of time, set a backtrack floor
@@ -63,8 +64,8 @@ struct ovpn_pktid_recv {
  * The returned packet ID becomes part of the AEAD nonce, so the helper rejects
  * the packet before the 32-bit packet-ID space wraps.
  *
- * The packet-ID soft threshold does not reject the packet. It returns 1 once
- * so the caller can notify userspace to rekey while packet-ID space remains.
+ * Crossing the soft threshold does not reject the packet. It returns 1 so the
+ * caller can request a rekey while packet-ID space remains.
  *
  * Return: 1 if userspace should be notified, 0 if no notification is needed,
  * or a negative error code otherwise.
@@ -72,19 +73,14 @@ struct ovpn_pktid_recv {
 static inline int ovpn_pktid_xmit_next(struct ovpn_pktid_xmit *pid, u32 *pktid)
 {
 	const u32 seq_num = atomic_fetch_add_unless(&pid->seq_num, 1, 0);
-	int ret = 0;
 
 	/* packet IDs are used to create cipher IVs and must not wrap */
 	if (unlikely(!seq_num))
 		return -ERANGE;
 
-	/* notify userspace before the packet ID space is close to wrapping */
-	if (unlikely(seq_num == PKTID_XMIT_REKEY_NOTIFY))
-		ret = 1;
-
 	*pktid = seq_num;
 
-	return ret;
+	return seq_num >= PKTID_XMIT_REKEY_NOTIFY;
 }
 
 /**

@@ -14,6 +14,7 @@
 #include <linux/rcupdate.h>
 #include <linux/workqueue.h>
 
+#include "crypto_limits.h"
 #include "pktid.h"
 #include "proto.h"
 
@@ -41,6 +42,8 @@ struct ovpn_peer_key_reset {
 
 struct ovpn_crypto_key_slot {
 	u8 key_id;
+	enum ovpn_cipher_alg cipher_alg;
+	struct ovpn_limit xmit_limit;
 
 	struct crypto_aead *encrypt;
 	struct crypto_aead *decrypt;
@@ -49,6 +52,9 @@ struct ovpn_crypto_key_slot {
 
 	struct ovpn_pktid_recv pid_recv ____cacheline_aligned_in_smp;
 	struct ovpn_pktid_xmit pid_xmit ____cacheline_aligned_in_smp;
+	atomic64_t xmit_usage;
+	/* whether userspace was notified that TX should rekey */
+	atomic_t xmit_rekey_notified;
 	struct work_struct free_work;
 	unsigned long rcu_state;
 	struct percpu_ref refcount;
