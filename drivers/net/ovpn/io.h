@@ -13,9 +13,9 @@
 #include <linux/cache.h>
 #include <linux/prefetch.h>
 
-/* DATA_V2 header size with AEAD encryption */
-#define OVPN_HEAD_ROOM (OVPN_DATA_V2_OVERHEAD +				   \
-			max(sizeof(struct udphdr), sizeof(struct tcphdr)) +\
+/* headroom needed by directly installed AEAD keys */
+#define OVPN_HEAD_ROOM (OVPN_AEAD_DIRECT_OVERHEAD + \
+			max(sizeof(struct udphdr), sizeof(struct tcphdr)) + \
 			max(sizeof(struct ipv6hdr), sizeof(struct iphdr)))
 
 /* max padding required by encryption */

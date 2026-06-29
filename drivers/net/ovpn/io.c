@@ -120,7 +120,7 @@ void ovpn_decrypt_post(void *data, int ret)
 	struct ovpn_socket *sock;
 	struct ovpn_peer *peer;
 	__be16 proto;
-	__be32 *pid;
+	u32 pktid;
 
 	/* crypto is happening asynchronously. this function will be called
 	 * again later by the crypto callback with a proper return code
@@ -144,9 +144,8 @@ void ovpn_decrypt_post(void *data, int ret)
 	if (unlikely(ret < 0))
 		goto drop;
 
-	/* PID sits after the op */
-	pid = (__force __be32 *)(skb->data + OVPN_OPCODE_SIZE);
-	ret = ovpn_pktid_recv(&ks->pid_recv, ntohl(*pid), 0);
+	pktid = ovpn_aead_direct_pktid(skb);
+	ret = ovpn_pktid_recv(&ks->pid_recv, pktid, 0);
 	if (unlikely(ret < 0)) {
 		net_err_ratelimited("%s: PKT ID RX error for peer %u: %d\n",
 				    netdev_name(peer->ovpn->dev), peer->id,
@@ -453,7 +452,7 @@ static bool ovpn_encrypt_gso_queue(struct sk_buff_head *skbs,
 
 	for (i = 0; i < segments; i++) {
 		skb = __skb_dequeue(skbs);
-		len = skb->len + OVPN_DATA_V2_OVERHEAD;
+		len = skb->len + OVPN_AEAD_DIRECT_OVERHEAD;
 
 		/* overlap fetching the next segment's shared payload with
 		 * encryption of the current segment
@@ -506,7 +505,7 @@ static struct sk_buff *ovpn_udp_gso_alloc(const struct sk_buff *first_segment,
 
 	skb_shinfo(gso_skb)->gso_type = SKB_GSO_UDP_L4;
 	skb_shinfo(gso_skb)->gso_size = first_segment->len +
-					OVPN_DATA_V2_OVERHEAD;
+					OVPN_AEAD_DIRECT_OVERHEAD;
 	skb_shinfo(gso_skb)->gso_segs = segments;
 
 	return gso_skb;
@@ -543,7 +542,7 @@ static void ovpn_send_gso(struct sk_buff_head *skbs, struct ovpn_peer *peer)
 	unsigned int max_segs = 1, seg_len, batch_len, segs;
 	struct sk_buff *batch;
 
-	seg_len = skb_peek(skbs)->len + OVPN_DATA_V2_OVERHEAD;
+	seg_len = skb_peek(skbs)->len + OVPN_AEAD_DIRECT_OVERHEAD;
 	max_segs = min_t(unsigned int, UDP_MAX_SEGMENTS,
 			 OVPN_UDP_GSO_MAX_PAYLOAD / seg_len);
 
@@ -566,7 +565,7 @@ static void ovpn_send_gso(struct sk_buff_head *skbs, struct ovpn_peer *peer)
 		 * group below
 		 */
 		batch_len = segs * (skb_peek(skbs)->len +
-				    OVPN_DATA_V2_OVERHEAD);
+				    OVPN_AEAD_DIRECT_OVERHEAD);
 		if (segs == skb_queue_len(skbs))
 			batch_len -= skb_peek(skbs)->len -
 				     skb_peek_tail(skbs)->len;
