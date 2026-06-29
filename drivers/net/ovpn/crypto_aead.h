@@ -28,5 +28,6 @@ struct ovpn_crypto_key_slot *
 ovpn_aead_crypto_key_slot_new(const struct ovpn_key_config *kc);
 
 enum ovpn_cipher_alg ovpn_aead_crypto_alg(struct ovpn_crypto_key_slot *ks);
+bool ovpn_aead_decrypt_failure_record(struct ovpn_crypto_key_slot *ks);
 
 #endif /* _NET_OVPN_OVPNAEAD_H_ */

@@ -135,6 +135,12 @@ void ovpn_decrypt_post(void *data, int ret)
 	/* crypto is done, cleanup skb CB and its members */
 	kfree(ovpn_skb_cb(skb)->crypto_tmp);
 
+	if (unlikely(ret == -EBADMSG)) {
+		if (unlikely(ovpn_aead_decrypt_failure_record(ks)))
+			ovpn_nl_key_swap_notify(peer, ks->key_id);
+		goto drop;
+	}
+
 	if (unlikely(ret < 0))
 		goto drop;
 
