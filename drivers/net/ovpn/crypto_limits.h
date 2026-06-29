@@ -48,12 +48,12 @@ ovpn_key_usage_limit_init(struct ovpn_limit *limit,
 
 static inline int ovpn_key_usage_xmit(atomic64_t *usage,
 				      const struct ovpn_limit *limit,
-				      u64 blocks)
+				      unsigned int packets, u64 blocks)
 {
 	u64 total;
 
 	/* count protected packets and their plaintext blocks */
-	total = atomic64_add_return(1 + blocks, usage);
+	total = atomic64_add_return(packets + blocks, usage);
 
 	/* tx must stop before the hard limit is crossed */
 	if (unlikely(total > limit->hard))

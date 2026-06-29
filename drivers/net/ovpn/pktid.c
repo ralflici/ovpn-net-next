@@ -17,9 +17,11 @@
 #include "main.h"
 #include "pktid.h"
 
-void ovpn_pktid_xmit_init(struct ovpn_pktid_xmit *pid)
+void ovpn_pktid_xmit_init(struct ovpn_pktid_xmit *pid,
+			  const struct ovpn_limit *limit)
 {
-	atomic_set(&pid->seq_num, 1);
+	atomic64_set(&pid->seq_num, 1);
+	pid->limit = *limit;
 }
 
 void ovpn_pktid_recv_init(struct ovpn_pktid_recv *pr)
@@ -31,7 +33,7 @@ void ovpn_pktid_recv_init(struct ovpn_pktid_recv *pr)
 /* Packet replay detection.
  * Allows ID backtrack of up to REPLAY_WINDOW_SIZE - 1.
  */
-int ovpn_pktid_recv(struct ovpn_pktid_recv *pr, u32 pkt_id, u32 pkt_time)
+int ovpn_pktid_recv(struct ovpn_pktid_recv *pr, u64 pkt_id, u32 pkt_time)
 {
 	const unsigned long now = jiffies;
 	int ret;
@@ -71,7 +73,7 @@ int ovpn_pktid_recv(struct ovpn_pktid_recv *pr, u32 pkt_id, u32 pkt_time)
 		pr->id = pkt_id;
 	} else if (pkt_id > pr->id) {
 		/* ID jumped forward by more than one */
-		const unsigned int delta = pkt_id - pr->id;
+		const u64 delta = pkt_id - pr->id;
 
 		if (delta < REPLAY_WINDOW_SIZE) {
 			unsigned int i;
@@ -95,7 +97,7 @@ int ovpn_pktid_recv(struct ovpn_pktid_recv *pr, u32 pkt_id, u32 pkt_time)
 		pr->id = pkt_id;
 	} else {
 		/* ID backtrack */
-		const unsigned int delta = pr->id - pkt_id;
+		const u64 delta = pr->id - pkt_id;
 
 		if (delta > pr->max_backtrack)
 			pr->max_backtrack = delta;

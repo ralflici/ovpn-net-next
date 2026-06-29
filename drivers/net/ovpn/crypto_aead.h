@@ -19,8 +19,9 @@ int ovpn_aead_encrypt(struct ovpn_peer *peer, struct ovpn_crypto_key_slot *ks,
 		      struct sk_buff *skb);
 int ovpn_aead_encrypt_gso(struct ovpn_peer *peer,
 			  struct ovpn_crypto_key_slot *ks,
-			  struct sk_buff *skb, struct sk_buff *gso_skb,
-			  unsigned int offset, u32 pktid);
+			  struct ovpn_key_ctx *key, struct sk_buff *skb,
+			  struct sk_buff *gso_skb,
+			  unsigned int offset, u64 pktid);
 int ovpn_aead_decrypt(struct ovpn_peer *peer, struct ovpn_crypto_key_slot *ks,
 		      struct sk_buff *skb);
 

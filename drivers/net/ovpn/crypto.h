@@ -64,6 +64,9 @@ struct ovpn_crypto_key_slot {
 	u8 key_id;
 	enum ovpn_cipher_alg cipher_alg;
 	struct ovpn_limit xmit_limit;
+	bool epoch_format;
+	unsigned int aad_size;
+	unsigned int pktid_size;
 	struct ovpn_key_ctx __rcu *encrypt;
 	struct ovpn_key_ctx __rcu *decrypt;
 	struct work_struct free_work;

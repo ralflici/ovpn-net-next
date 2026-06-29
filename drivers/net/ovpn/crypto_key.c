@@ -112,6 +112,7 @@ static struct ovpn_key_ctx *
 ovpn_key_ctx_new(const char *title, const char *alg_name,
 		 const struct ovpn_key_direction *dir, bool encrypt)
 {
+	struct ovpn_limit pktid_limit;
 	struct ovpn_key_ctx *key;
 	size_t tail_offset;
 	int ret;
@@ -139,7 +140,8 @@ ovpn_key_ctx_new(const char *title, const char *alg_name,
 	INIT_WORK(&key->free_work, ovpn_key_ctx_free_work);
 	/* initialize only the packet ID direction this context owns */
 	if (encrypt) {
-		ovpn_pktid_xmit_init(&key->pid.xmit);
+		ovpn_pktid_xmit_limit_init(&pktid_limit, false);
+		ovpn_pktid_xmit_init(&key->pid.xmit, &pktid_limit);
 		atomic64_set(&key->xmit_usage, 0);
 		atomic_set(&key->xmit_rekey_notified, 0);
 	} else {
@@ -226,11 +228,14 @@ ovpn_crypto_key_slot_new(const struct ovpn_key_config *kc)
 	if (!ks)
 		return ERR_PTR(-ENOMEM);
 
-	ks->encrypt = NULL;
-	ks->decrypt = NULL;
+	RCU_INIT_POINTER(ks->encrypt, NULL);
+	RCU_INIT_POINTER(ks->decrypt, NULL);
 	INIT_WORK(&ks->free_work, ovpn_crypto_key_slot_free_work);
 	ks->key_id = kc->key_id;
 	ks->cipher_alg = kc->cipher_alg;
+	ks->epoch_format = false;
+	ks->aad_size = OVPN_AEAD_DIRECT_AAD_SIZE;
+	ks->pktid_size = OVPN_NONCE_WIRE_SIZE;
 	ovpn_key_usage_limit_init(&ks->xmit_limit, kc->cipher_alg);
 
 	key = ovpn_key_ctx_new("encrypt", alg_name, &kc->encrypt, true);

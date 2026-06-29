@@ -119,9 +119,10 @@ void ovpn_decrypt_post(void *data, int ret)
 	struct sk_buff *skb = data;
 	struct ovpn_socket *sock;
 	struct ovpn_key_ctx *key;
+	u64 pktid;
 	struct ovpn_peer *peer;
+	u16 pkt_epoch;
 	__be16 proto;
-	u32 pktid;
 
 	/* crypto is happening asynchronously. this function will be called
 	 * again later by the crypto callback with a proper return code
@@ -146,7 +147,8 @@ void ovpn_decrypt_post(void *data, int ret)
 	if (unlikely(ret < 0))
 		goto drop;
 
-	pktid = ovpn_aead_direct_pktid(skb);
+	pktid = ovpn_pktid_read(skb->data + OVPN_OPCODE_SIZE, false,
+				&pkt_epoch);
 	ret = ovpn_pktid_recv(&key->pid.recv, pktid, 0);
 	if (unlikely(ret < 0)) {
 		net_err_ratelimited("%s: PKT ID RX error for peer %u: %d\n",
@@ -426,8 +428,12 @@ static bool ovpn_encrypt_gso_queue(struct sk_buff_head *skbs,
 {
 	unsigned int offset = 0, i, len;
 	struct ovpn_crypto_key_slot *ks;
+	u64 aead_blocks, first_blocks;
+	struct ovpn_key_ctx *key;
 	struct sk_buff *skb;
-	u32 first_pktid;
+	bool notify = false;
+	u64 first_pktid;
+	int ret;
 
 	/* acquire all shared state before removing the first input skb so that
 	 * failure can leave the queue intact for the ordinary transmit path
@@ -435,17 +441,50 @@ static bool ovpn_encrypt_gso_queue(struct sk_buff_head *skbs,
 	ks = ovpn_encrypt_refs_get(peer);
 	if (unlikely(!ks))
 		return false;
-
-	/* reserve the complete range before dequeuing any input skb so that a
-	 * failure leaves the ordinary transmit path available as a fallback
-	 */
-	if (unlikely(ovpn_pktid_xmit_range(&ks->pid_xmit, segments,
-					   &first_pktid))) {
-		ovpn_encrypt_key_exhausted(peer, ks);
+	ret = ovpn_key_ctx_get(&key, &ks->encrypt);
+	if (unlikely(ret)) {
 		ovpn_crypto_key_slot_put(ks);
 		ovpn_peer_put(peer);
 		return false;
 	}
+
+	/* all selected skbs have the same length unless this group includes
+	 * the shorter final segment, so account the batch without walking it
+	 */
+	first_blocks = ovpn_aead_limit_blocks(ks->cipher_alg, ks->aad_size,
+					      skb_peek(skbs)->len);
+	aead_blocks = segments * first_blocks;
+	if (segments == skb_queue_len(skbs)) {
+		aead_blocks -= first_blocks;
+		aead_blocks += ovpn_aead_limit_blocks(ks->cipher_alg,
+						      ks->aad_size,
+						      skb_peek_tail(skbs)->len);
+	}
+
+	/* reserve the complete range before dequeuing any input skb so that a
+	 * failure leaves the ordinary transmit path available as a fallback
+	 */
+	ret = ovpn_pktid_xmit_range(&key->pid.xmit, segments, &first_pktid);
+	if (unlikely(ret < 0)) {
+		ovpn_encrypt_key_exhausted(peer, ks);
+		ovpn_key_ctx_put(key);
+		ovpn_crypto_key_slot_put(ks);
+		ovpn_peer_put(peer);
+		return false;
+	}
+	notify = ret > 0;
+	ret = ovpn_key_usage_xmit(&key->xmit_usage, &ks->xmit_limit,
+				  segments, aead_blocks);
+	if (unlikely(ret < 0)) {
+		ovpn_encrypt_key_exhausted(peer, ks);
+		ovpn_key_ctx_put(key);
+		ovpn_crypto_key_slot_put(ks);
+		ovpn_peer_put(peer);
+		return false;
+	}
+	notify |= ret > 0;
+	if (unlikely(notify) && !atomic_xchg(&key->xmit_rekey_notified, 1))
+		ovpn_nl_key_swap_notify(peer, ks->key_id);
 
 	/* the aggregate owns these references until every sync or async crypto
 	 * completion has finished
@@ -453,6 +492,7 @@ static bool ovpn_encrypt_gso_queue(struct sk_buff_head *skbs,
 	memset(ovpn_skb_cb(batch), 0, sizeof(struct ovpn_cb));
 	ovpn_skb_cb(batch)->peer = peer;
 	ovpn_skb_cb(batch)->ks = ks;
+	ovpn_skb_cb(batch)->key = key;
 	atomic_set(&ovpn_skb_cb(batch)->batch_state.pending, segments);
 	atomic_set(&ovpn_skb_cb(batch)->batch_state.failed, 0);
 
@@ -468,8 +508,9 @@ static bool ovpn_encrypt_gso_queue(struct sk_buff_head *skbs,
 
 		memset(ovpn_skb_cb(skb), 0, sizeof(struct ovpn_cb));
 		ovpn_skb_cb(skb)->batch = batch;
-		ovpn_encrypt_post(skb, ovpn_aead_encrypt_gso(peer, ks, skb,
-							     batch, offset,
+		ovpn_encrypt_post(skb, ovpn_aead_encrypt_gso(peer, ks, key,
+							     skb, batch,
+							     offset,
 							     first_pktid + i));
 		offset += len;
 	}
