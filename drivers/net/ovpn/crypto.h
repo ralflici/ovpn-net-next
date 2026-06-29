@@ -54,14 +54,18 @@ struct ovpn_key_ctx {
 	atomic64_t decrypt_failures;
 	/* whether userspace was notified of excessive decrypt failures */
 	atomic_t decrypt_failure_notified;
+	struct work_struct free_work;
+	/* RCU state recorded when this context is unpublished */
+	unsigned long rcu_state;
+	struct percpu_ref refcount;
 };
 
 struct ovpn_crypto_key_slot {
 	u8 key_id;
 	enum ovpn_cipher_alg cipher_alg;
 	struct ovpn_limit xmit_limit;
-	struct ovpn_key_ctx *encrypt;
-	struct ovpn_key_ctx *decrypt;
+	struct ovpn_key_ctx __rcu *encrypt;
+	struct ovpn_key_ctx __rcu *decrypt;
 	struct work_struct free_work;
 	unsigned long rcu_state;
 	struct percpu_ref refcount;
@@ -157,6 +161,46 @@ static inline void ovpn_crypto_key_slot_kill(struct ovpn_crypto_key_slot *ks)
 	ks->rcu_state = get_state_synchronize_rcu();
 	percpu_ref_kill(&ks->refcount);
 }
+
+void ovpn_key_ctx_release(struct percpu_ref *ref);
+
+static inline void ovpn_key_ctx_put(struct ovpn_key_ctx *key)
+{
+	if (key)
+		percpu_ref_put(&key->refcount);
+}
+
+/**
+ * ovpn_key_ctx_kill - stop new users and drop the initial reference
+ * @key: key context which has already been unpublished
+ *
+ * Save the current RCU state so the final worker only waits when readers that
+ * could still have seen this context have not completed yet.
+ */
+static inline void ovpn_key_ctx_kill(struct ovpn_key_ctx *key)
+{
+	key->rcu_state = get_state_synchronize_rcu();
+	percpu_ref_kill(&key->refcount);
+}
+
+static inline int ovpn_key_ctx_get(struct ovpn_key_ctx **out,
+				   struct ovpn_key_ctx __rcu **rcu_ptr)
+{
+	struct ovpn_key_ctx *key;
+
+	rcu_read_lock();
+	key = rcu_dereference(*rcu_ptr);
+	if (unlikely(!key || !percpu_ref_tryget_live_rcu(&key->refcount))) {
+		rcu_read_unlock();
+		return -ENOKEY;
+	}
+	rcu_read_unlock();
+
+	*out = key;
+	return 0;
+}
+
+void ovpn_crypto_key_slot_kill_contexts(struct ovpn_crypto_key_slot *ks);
 
 int ovpn_crypto_state_reset(struct ovpn_crypto_state *cs,
 			    const struct ovpn_peer_key_reset *pkr);

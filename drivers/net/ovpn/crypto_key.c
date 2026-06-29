@@ -72,15 +72,40 @@ error:
 	return ERR_PTR(ret);
 }
 
+static void ovpn_key_ctx_free_crypto(struct ovpn_key_ctx *key)
+{
+	if (key->tfm)
+		crypto_free_aead(key->tfm);
+	memzero_explicit(key->implicit_iv, sizeof(key->implicit_iv));
+}
+
 static void ovpn_key_ctx_free(struct ovpn_key_ctx *key)
 {
 	if (!key)
 		return;
 
-	if (key->tfm)
-		crypto_free_aead(key->tfm);
-	memzero_explicit(key->implicit_iv, sizeof(key->implicit_iv));
+	ovpn_key_ctx_free_crypto(key);
 	kfree(key);
+}
+
+static void ovpn_key_ctx_free_work(struct work_struct *work)
+{
+	struct ovpn_key_ctx *key;
+
+	key = container_of(work, struct ovpn_key_ctx, free_work);
+	/* the context may have been replaced independently of its key slot */
+	cond_synchronize_rcu(key->rcu_state);
+	percpu_ref_exit(&key->refcount);
+	ovpn_key_ctx_free_crypto(key);
+	kfree(key);
+}
+
+void ovpn_key_ctx_release(struct percpu_ref *ref)
+{
+	struct ovpn_key_ctx *key;
+
+	key = container_of(ref, struct ovpn_key_ctx, refcount);
+	queue_work(ovpn_wq, &key->free_work);
 }
 
 static struct ovpn_key_ctx *
@@ -111,6 +136,7 @@ ovpn_key_ctx_new(const char *title, const char *alg_name,
 	memcpy(key->implicit_iv + tail_offset, dir->nonce_tail,
 	       dir->nonce_tail_size);
 
+	INIT_WORK(&key->free_work, ovpn_key_ctx_free_work);
 	/* initialize only the packet ID direction this context owns */
 	if (encrypt) {
 		ovpn_pktid_xmit_init(&key->pid.xmit);
@@ -122,13 +148,39 @@ ovpn_key_ctx_new(const char *title, const char *alg_name,
 		atomic_set(&key->decrypt_failure_notified, 0);
 	}
 
+	ret = percpu_ref_init(&key->refcount, ovpn_key_ctx_release, 0,
+			      GFP_KERNEL);
+	if (ret) {
+		ovpn_key_ctx_free(key);
+		return ERR_PTR(ret);
+	}
+
 	return key;
 }
 
-static void ovpn_crypto_key_slot_free(struct ovpn_crypto_key_slot *ks)
+/* destroy initialized contexts while unwinding an unpublished slot */
+static void ovpn_crypto_key_slot_destroy(struct ovpn_crypto_key_slot *ks)
 {
-	ovpn_key_ctx_free(ks->encrypt);
-	ovpn_key_ctx_free(ks->decrypt);
+	struct ovpn_key_ctx *key;
+
+	key = rcu_access_pointer(ks->encrypt);
+	if (key) {
+		percpu_ref_exit(&key->refcount);
+		ovpn_key_ctx_free(key);
+	}
+
+	key = rcu_access_pointer(ks->decrypt);
+	if (key) {
+		percpu_ref_exit(&key->refcount);
+		ovpn_key_ctx_free(key);
+	}
+}
+
+/* the slot's final release proves that no context users remain */
+void ovpn_crypto_key_slot_kill_contexts(struct ovpn_crypto_key_slot *ks)
+{
+	ovpn_key_ctx_kill(rcu_access_pointer(ks->encrypt));
+	ovpn_key_ctx_kill(rcu_access_pointer(ks->decrypt));
 }
 
 static void ovpn_crypto_key_slot_free_work(struct work_struct *work)
@@ -142,7 +194,6 @@ static void ovpn_crypto_key_slot_free_work(struct work_struct *work)
 	 */
 	cond_synchronize_rcu(ks->rcu_state);
 	percpu_ref_exit(&ks->refcount);
-	ovpn_crypto_key_slot_free(ks);
 	kfree(ks);
 }
 
@@ -150,6 +201,7 @@ struct ovpn_crypto_key_slot *
 ovpn_crypto_key_slot_new(const struct ovpn_key_config *kc)
 {
 	struct ovpn_crypto_key_slot *ks = NULL;
+	struct ovpn_key_ctx *key;
 	const char *alg_name;
 	int ret;
 
@@ -181,21 +233,19 @@ ovpn_crypto_key_slot_new(const struct ovpn_key_config *kc)
 	ks->cipher_alg = kc->cipher_alg;
 	ovpn_key_usage_limit_init(&ks->xmit_limit, kc->cipher_alg);
 
-	ks->encrypt = ovpn_key_ctx_new("encrypt", alg_name, &kc->encrypt,
-				       true);
-	if (IS_ERR(ks->encrypt)) {
-		ret = PTR_ERR(ks->encrypt);
-		ks->encrypt = NULL;
+	key = ovpn_key_ctx_new("encrypt", alg_name, &kc->encrypt, true);
+	if (IS_ERR(key)) {
+		ret = PTR_ERR(key);
 		goto destroy_ks;
 	}
+	RCU_INIT_POINTER(ks->encrypt, key);
 
-	ks->decrypt = ovpn_key_ctx_new("decrypt", alg_name, &kc->decrypt,
-				       false);
-	if (IS_ERR(ks->decrypt)) {
-		ret = PTR_ERR(ks->decrypt);
-		ks->decrypt = NULL;
+	key = ovpn_key_ctx_new("decrypt", alg_name, &kc->decrypt, false);
+	if (IS_ERR(key)) {
+		ret = PTR_ERR(key);
 		goto destroy_ks;
 	}
+	RCU_INIT_POINTER(ks->decrypt, key);
 
 	ret = percpu_ref_init(&ks->refcount, ovpn_crypto_key_slot_release, 0,
 			      GFP_KERNEL);
@@ -205,24 +255,15 @@ ovpn_crypto_key_slot_new(const struct ovpn_key_config *kc)
 	return ks;
 
 destroy_ks:
-	ovpn_crypto_key_slot_free(ks);
+	ovpn_crypto_key_slot_destroy(ks);
 	kfree(ks);
 	return ERR_PTR(ret);
 }
 
 enum ovpn_cipher_alg ovpn_crypto_key_slot_alg(struct ovpn_crypto_key_slot *ks)
 {
-	const char *alg_name;
-
-	if (!ks->encrypt || !ks->encrypt->tfm)
+	if (!ks)
 		return OVPN_CIPHER_ALG_NONE;
 
-	alg_name = crypto_tfm_alg_name(crypto_aead_tfm(ks->encrypt->tfm));
-
-	if (!strcmp(alg_name, ALG_NAME_AES))
-		return OVPN_CIPHER_ALG_AES_GCM;
-	else if (!strcmp(alg_name, ALG_NAME_CHACHAPOLY))
-		return OVPN_CIPHER_ALG_CHACHA20_POLY1305;
-	else
-		return OVPN_CIPHER_ALG_NONE;
+	return ks->cipher_alg;
 }

@@ -131,14 +131,14 @@ void ovpn_decrypt_post(void *data, int ret)
 
 	payload_offset = ovpn_skb_cb(skb)->payload_offset;
 	ks = ovpn_skb_cb(skb)->ks;
-	key = ks->decrypt;
+	key = ovpn_skb_cb(skb)->key;
 	peer = ovpn_skb_cb(skb)->peer;
 
 	/* crypto is done, cleanup skb CB and its members */
 	kfree(ovpn_skb_cb(skb)->crypto_tmp);
 
 	if (unlikely(ret == -EBADMSG)) {
-		if (unlikely(ovpn_aead_decrypt_failure_record(key)))
+		if (key && unlikely(ovpn_aead_decrypt_failure_record(key)))
 			ovpn_nl_key_swap_notify(peer, ks->key_id);
 		goto drop;
 	}
@@ -218,6 +218,7 @@ drop:
 		ovpn_dev_dstats_rx_dropped(peer->ovpn->dev);
 	kfree_skb(skb);
 drop_nocount:
+	ovpn_key_ctx_put(key);
 	if (likely(ks))
 		ovpn_crypto_key_slot_put(ks);
 	if (likely(peer))
@@ -268,6 +269,7 @@ void ovpn_encrypt_post(void *data, int ret)
 	struct sk_buff *skb = data;
 	struct ovpn_socket *sock;
 	struct ovpn_cb *batch_cb;
+	struct ovpn_key_ctx *key;
 	struct ovpn_peer *peer;
 	struct sk_buff *batch;
 
@@ -283,6 +285,7 @@ void ovpn_encrypt_post(void *data, int ret)
 	batch = ovpn_skb_cb(skb)->batch;
 	peer = ovpn_skb_cb(skb)->peer;
 	ks = ovpn_skb_cb(skb)->ks;
+	key = batch ? ovpn_skb_cb(batch)->key : ovpn_skb_cb(skb)->key;
 
 	/* crypto is done, cleanup skb CB and its members */
 	kfree(ovpn_skb_cb(skb)->crypto_tmp);
@@ -352,6 +355,7 @@ err:
 	if (unlikely(skb))
 		ovpn_dev_dstats_tx_dropped(peer->ovpn->dev, packets);
 	kfree_skb(skb);
+	ovpn_key_ctx_put(key);
 	if (likely(ks))
 		ovpn_crypto_key_slot_put(ks);
 	if (likely(peer))

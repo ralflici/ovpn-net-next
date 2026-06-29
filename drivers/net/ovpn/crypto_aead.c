@@ -190,8 +190,8 @@ static void ovpn_aead_encrypt_header(struct ovpn_peer *peer,
 int ovpn_aead_encrypt(struct ovpn_peer *peer, struct ovpn_crypto_key_slot *ks,
 		      struct sk_buff *skb)
 {
-	struct ovpn_key_ctx *key = ks->encrypt;
 	unsigned int plaintext_len, tag_size;
+	struct ovpn_key_ctx *key = NULL;
 	struct aead_request *req;
 	struct sk_buff *trailer;
 	struct scatterlist *sg;
@@ -204,6 +204,12 @@ int ovpn_aead_encrypt(struct ovpn_peer *peer, struct ovpn_crypto_key_slot *ks,
 	ovpn_skb_cb(skb)->peer = peer;
 	ovpn_skb_cb(skb)->ks = ks;
 	plaintext_len = skb->len;
+
+	ret = ovpn_key_ctx_get(&key, &ks->encrypt);
+	if (unlikely(ret))
+		return ret;
+	ovpn_skb_cb(skb)->key = key;
+
 	tag_size = crypto_aead_authsize(key->tfm);
 
 	/* Sample AEAD header format:
@@ -369,8 +375,8 @@ int ovpn_aead_encrypt_gso(struct ovpn_peer *peer,
 int ovpn_aead_decrypt(struct ovpn_peer *peer, struct ovpn_crypto_key_slot *ks,
 		      struct sk_buff *skb)
 {
-	struct ovpn_key_ctx *key = ks->decrypt;
 	unsigned int payload_offset, tag_size;
+	struct ovpn_key_ctx *key = NULL;
 	int ret, payload_len, nfrags;
 	struct aead_request *req;
 	struct sk_buff *trailer;
@@ -378,13 +384,19 @@ int ovpn_aead_decrypt(struct ovpn_peer *peer, struct ovpn_crypto_key_slot *ks,
 	void *tmp;
 	u8 *iv;
 
+	ovpn_skb_cb(skb)->peer = peer;
+	ovpn_skb_cb(skb)->ks = ks;
+
+	ret = ovpn_key_ctx_get(&key, &ks->decrypt);
+	if (unlikely(ret))
+		return ret;
+	ovpn_skb_cb(skb)->key = key;
+
 	tag_size = crypto_aead_authsize(key->tfm);
 	payload_offset = ovpn_aead_direct_payload_offset(tag_size);
 	payload_len = skb->len - payload_offset;
 
 	ovpn_skb_cb(skb)->payload_offset = payload_offset;
-	ovpn_skb_cb(skb)->peer = peer;
-	ovpn_skb_cb(skb)->ks = ks;
 
 	/* sanity check on packet size, payload size must be >= 0 */
 	if (unlikely(payload_len < 0))

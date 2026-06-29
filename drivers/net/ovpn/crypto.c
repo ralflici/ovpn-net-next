@@ -22,6 +22,8 @@ void ovpn_crypto_key_slot_release(struct percpu_ref *ref)
 	struct ovpn_crypto_key_slot *ks;
 
 	ks = container_of(ref, struct ovpn_crypto_key_slot, refcount);
+	/* every key-context user also owns a slot reference */
+	ovpn_crypto_key_slot_kill_contexts(ks);
 	queue_work(ovpn_wq, &ks->free_work);
 }
 

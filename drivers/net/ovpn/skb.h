@@ -25,6 +25,7 @@
  *		containing the IV, the scatter gather list and the aead request
  * @peer: peer used by this crypto operation or owned by this aggregate
  * @ks: crypto key slot used by this operation or owned by this aggregate
+ * @key: key context used by this operation or owned by this aggregate
  * @payload_offset: offset in the skb where the payload starts
  * @nosignal: whether this skb should be sent with the MSG_NOSIGNAL flag (TCP)
  * @batch: UDP GSO aggregate receiving this input skb's encrypted payload
@@ -34,6 +35,7 @@ struct ovpn_cb {
 	void *crypto_tmp;
 	struct ovpn_peer *peer;
 	struct ovpn_crypto_key_slot *ks;
+	struct ovpn_key_ctx *key;
 
 	/* Ordinary encryption leaves this union zeroed. Decryption and TCP use
 	 * their ordinary fields, a UDP GSO input stores its output aggregate,
