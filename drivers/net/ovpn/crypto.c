@@ -15,7 +15,6 @@
 #include "ovpnpriv.h"
 #include "main.h"
 #include "pktid.h"
-#include "crypto_aead.h"
 #include "crypto.h"
 
 void ovpn_crypto_key_slot_release(struct percpu_ref *ref)
@@ -85,7 +84,7 @@ int ovpn_crypto_state_reset(struct ovpn_crypto_state *cs,
 	    pkr->slot != OVPN_KEY_SLOT_SECONDARY)
 		return -EINVAL;
 
-	new = ovpn_aead_crypto_key_slot_new(&pkr->key);
+	new = ovpn_crypto_key_slot_new(&pkr->key);
 	if (IS_ERR(new))
 		return PTR_ERR(new);
 
@@ -198,7 +197,7 @@ int ovpn_crypto_config_get(struct ovpn_crypto_state *cs,
 		return -ENOENT;
 	}
 
-	keyconf->cipher_alg = ovpn_aead_crypto_alg(ks);
+	keyconf->cipher_alg = ovpn_crypto_key_slot_alg(ks);
 	keyconf->key_id = ks->key_id;
 	rcu_read_unlock();
 

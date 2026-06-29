@@ -10,6 +10,7 @@ obj-$(CONFIG_OVPN) := ovpn.o
 ovpn-y += bind.o
 ovpn-y += crypto.o
 ovpn-y += crypto_aead.o
+ovpn-y += crypto_key.o
 ovpn-y += main.o
 ovpn-y += io.o
 ovpn-y += netlink.o
