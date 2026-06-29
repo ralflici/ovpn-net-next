@@ -385,6 +385,8 @@ static void ovpn_refill_future_buffer(struct ovpn_crypto_key_slot *ks,
 
 	/* insert generated keys under the selected ring lock */
 	spin_lock_bh(lock);
+	if (!encrypt)
+		write_seqcount_begin(&ks->rx_seqcount);
 	for (replaced = 0; replaced < created; replaced++) {
 		if (WARN_ON_ONCE(future_keys->full))
 			break;
@@ -400,6 +402,8 @@ static void ovpn_refill_future_buffer(struct ovpn_crypto_key_slot *ks,
 			future_keys->full = true;
 	}
 	full = future_keys->full;
+	if (!encrypt)
+		write_seqcount_end(&ks->rx_seqcount);
 	spin_unlock_bh(lock);
 
 	for (i = 0; i < replaced; i++) {
@@ -547,6 +551,7 @@ struct ovpn_crypto_key_slot *
 ovpn_crypto_key_slot_new(const struct ovpn_key_config *kc)
 {
 	struct ovpn_crypto_key_slot *ks = NULL;
+	unsigned int direct_payload_offset;
 	struct ovpn_key_ctx *key;
 	const char *alg_name;
 	int ret;
@@ -580,6 +585,9 @@ ovpn_crypto_key_slot_new(const struct ovpn_key_config *kc)
 	if (!ks)
 		return ERR_PTR(-ENOMEM);
 
+	direct_payload_offset =
+		ovpn_aead_direct_payload_offset(OVPN_AEAD_TAG_SIZE);
+
 	RCU_INIT_POINTER(ks->encrypt, NULL);
 	RCU_INIT_POINTER(ks->decrypt, NULL);
 	INIT_WORK(&ks->free_work, ovpn_crypto_key_slot_free_work);
@@ -589,8 +597,10 @@ ovpn_crypto_key_slot_new(const struct ovpn_key_config *kc)
 	ks->epoch_format = kc->use_epoch_keys;
 	ks->aad_size = kc->use_epoch_keys ? OVPN_AEAD_EPOCH_AAD_SIZE :
 					     OVPN_AEAD_DIRECT_AAD_SIZE;
-	ks->pktid_size = kc->use_epoch_keys ? OVPN_EPOCH_NONCE_WIRE_SIZE :
-					       OVPN_NONCE_WIRE_SIZE;
+	ks->payload_offset = kc->use_epoch_keys ?
+			     OVPN_AEAD_EPOCH_AAD_SIZE :
+			     direct_payload_offset;
+	ks->tail_tag_size = kc->use_epoch_keys ? OVPN_AEAD_TAG_SIZE : 0;
 	ovpn_key_usage_limit_init(&ks->xmit_limit, kc->cipher_alg);
 
 	if (kc->use_epoch_keys) {
@@ -622,6 +632,7 @@ ovpn_crypto_key_slot_new(const struct ovpn_key_config *kc)
 
 		INIT_WORK(&ks->rx_refill, ovpn_refill_future_buffer_rx);
 		spin_lock_init(&ks->rx_lock);
+		seqcount_spinlock_init(&ks->rx_seqcount, &ks->rx_lock);
 		key = ovpn_key_ctx_create_epoch(false, alg_name,
 						&ks->epoch_key_recv);
 	} else {

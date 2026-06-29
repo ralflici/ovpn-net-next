@@ -12,6 +12,7 @@
 
 #include <linux/percpu-refcount.h>
 #include <linux/rcupdate.h>
+#include <linux/seqlock.h>
 #include <linux/workqueue.h>
 
 #include "crypto_epoch.h"
@@ -84,7 +85,8 @@ struct ovpn_crypto_key_slot {
 	const char *alg_name;
 	bool epoch_format;
 	unsigned int aad_size;
-	unsigned int pktid_size;
+	unsigned int payload_offset;
+	unsigned int tail_tag_size;
 
 	struct ovpn_epoch_key epoch_key_send;
 	struct ovpn_epoch_key epoch_key_recv;
@@ -101,8 +103,10 @@ struct ovpn_crypto_key_slot {
 
 	/* protects encrypt and future_tx_keys */
 	spinlock_t tx_lock;
-	/* protects decrypt, retiring_key and future_rx_keys */
+	/* serializes updates to decrypt, retiring_key and future_rx_keys */
 	spinlock_t rx_lock;
+	/* detects concurrent updates during lockless RX key lookup */
+	seqcount_spinlock_t rx_seqcount;
 
 	struct work_struct free_work;
 	unsigned long rcu_state;
