@@ -87,6 +87,8 @@ struct ovpn_crypto_key_slot {
 	unsigned int aad_size;
 	unsigned int payload_offset;
 	unsigned int tail_tag_size;
+	/* highest epoch requested by either the TX or RX path */
+	atomic_t tx_epoch_request;
 
 	struct ovpn_epoch_key epoch_key_send;
 	struct ovpn_epoch_key epoch_key_recv;

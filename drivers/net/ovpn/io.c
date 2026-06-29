@@ -112,6 +112,185 @@ static void ovpn_netdev_write(struct ovpn_peer *peer, struct sk_buff *skb)
 	local_bh_enable();
 }
 
+static void ovpn_rx_request_tx_rotation(struct ovpn_crypto_key_slot *ks,
+					const struct ovpn_key_ctx *decrypt)
+{
+	struct ovpn_key_ctx *current_decrypt, *encrypt;
+
+	rcu_read_lock();
+	current_decrypt = rcu_dereference(ks->decrypt);
+	encrypt = rcu_dereference(ks->encrypt);
+	/* only current rx key usage can ask the peer to move forward */
+	if (decrypt == current_decrypt &&
+	    (!encrypt || decrypt->epoch >= encrypt->epoch))
+		ovpn_request_encrypt_epoch(ks, decrypt->epoch + 1);
+	rcu_read_unlock();
+}
+
+/**
+ * ovpn_advance_decrypt_key - promote RX to a target epoch
+ * @ks: key slot containing RX epoch state
+ * @target_epoch: authenticated epoch to promote RX to
+ *
+ * RX promotion consumes future keys up to @target_epoch, moves the closest
+ * previous epoch to the retiring slot for reordered packets, and schedules
+ * refill for the consumed future-key slots. Local TX is advanced as well so
+ * outbound packets signal the peer to leave older epochs.
+ *
+ * Return: 0 on success, -EINPROGRESS if the RX lock is busy, -EALREADY if RX
+ * is already at or beyond @target_epoch, or -EINVAL if the future ring cannot
+ * provide @target_epoch.
+ */
+static int ovpn_advance_decrypt_key(struct ovpn_crypto_key_slot *ks,
+				    u16 target_epoch)
+{
+	u16 stale_count = 0, advance, count, index, stale_index, i;
+	struct ovpn_key_ctx *stale[OVPN_EPOCH_FUTURE_KEYS_COUNT];
+	struct ovpn_key_ctx *old_decrypt, *new_decrypt, *future;
+	struct ovpn_key_ctx *old_retiring, *new_retiring;
+	struct ovpn_key_ctx __rcu **retire_slot, **slot;
+	u16 retire_index;
+
+	/* concurrent promotion or refill means another context is moving rx */
+	if (unlikely(!spin_trylock_bh(&ks->rx_lock)))
+		return -EINPROGRESS;
+	lockdep_assert_held(&ks->rx_lock);
+
+	old_retiring = rcu_dereference_protected(ks->retiring_key, 1);
+	old_decrypt = rcu_dereference_protected(ks->decrypt, 1);
+	/* current decrypt key is always installed while the slot is alive */
+	if (unlikely(target_epoch <= old_decrypt->epoch)) {
+		spin_unlock_bh(&ks->rx_lock);
+		return -EALREADY;
+	}
+
+	count = ovpn_epoch_future_keys_count(&ks->future_rx_keys);
+	advance = target_epoch - old_decrypt->epoch;
+	/* authenticated epoch must be available in the future ring */
+	if (unlikely(count < advance)) {
+		spin_unlock_bh(&ks->rx_lock);
+		return -EINVAL;
+	}
+
+	/* get the authenticated future key from the ring */
+	index = (ks->future_rx_keys.tail + advance - 1) %
+		OVPN_EPOCH_FUTURE_KEYS_COUNT;
+	slot = &ks->future_rx_keys.keys[index];
+	new_decrypt = rcu_dereference_protected(*slot, 1);
+	if (WARN_ON_ONCE(!new_decrypt ||
+			 new_decrypt->epoch != target_epoch)) {
+		spin_unlock_bh(&ks->rx_lock);
+		return -EINVAL;
+	}
+
+	new_retiring = old_decrypt;
+	if (unlikely(advance > 1)) {
+		/* keep target_epoch - 1 for reordered packets after jumps */
+		retire_index = (ks->future_rx_keys.tail + advance - 2) %
+			       OVPN_EPOCH_FUTURE_KEYS_COUNT;
+		retire_slot = &ks->future_rx_keys.keys[retire_index];
+		new_retiring = rcu_dereference_protected(*retire_slot, 1);
+		if (WARN_ON_ONCE(!new_retiring ||
+				 new_retiring->epoch != target_epoch - 1)) {
+			spin_unlock_bh(&ks->rx_lock);
+			return -EINVAL;
+		}
+	}
+
+	write_seqcount_begin(&ks->rx_seqcount);
+	for (i = 0; i < advance; i++) {
+		/* drop skipped future keys when advancing past them */
+		stale_index = (ks->future_rx_keys.tail + i) %
+			      OVPN_EPOCH_FUTURE_KEYS_COUNT;
+		slot = &ks->future_rx_keys.keys[stale_index];
+		future = rcu_dereference_protected(*slot, 1);
+		if (future != new_decrypt && future != new_retiring)
+			stale[stale_count++] = future;
+		RCU_INIT_POINTER(*slot, NULL);
+	}
+
+	/* keep the nearest previous rx key for reordered packets */
+	rcu_assign_pointer(ks->retiring_key, new_retiring);
+	rcu_assign_pointer(ks->decrypt, new_decrypt);
+	ks->future_rx_keys.tail = (ks->future_rx_keys.tail + advance) %
+				  OVPN_EPOCH_FUTURE_KEYS_COUNT;
+	ks->future_rx_keys.full = false;
+	write_seqcount_end(&ks->rx_seqcount);
+	spin_unlock_bh(&ks->rx_lock);
+
+	ovpn_schedule_refill(ks, false);
+	if (old_retiring)
+		ovpn_key_ctx_kill(old_retiring);
+	if (new_retiring != old_decrypt)
+		ovpn_key_ctx_kill(old_decrypt);
+	for (i = 0; i < stale_count; i++)
+		ovpn_key_ctx_kill(stale[i]);
+
+	/* remember the target so tx can retry if promotion cannot complete */
+	ovpn_request_encrypt_epoch(ks, target_epoch);
+	/* move local tx forward to signal the peer to advance as well */
+	ovpn_advance_encrypt_key(ks, target_epoch);
+
+	return 0;
+}
+
+/**
+ * ovpn_check_rotate_keys - promote RX after authenticating a future epoch
+ * @peer: peer that supplied the authenticated packet
+ * @ks: key slot containing RX epoch state
+ * @decrypt: key that authenticated the packet
+ *
+ * Current and retiring keys do not move RX state. A future key is promoted only
+ * after authentication has completed, which prevents unauthenticated packets
+ * from forcing epoch advancement.
+ *
+ * Return: 0 if no fatal rotation error occurred, -ERANGE if epoch space is
+ * exhausted and userspace must install fresh key material.
+ */
+static int ovpn_check_rotate_keys(struct ovpn_peer *peer,
+				  struct ovpn_crypto_key_slot *ks,
+				  struct ovpn_key_ctx *decrypt)
+{
+	struct ovpn_key_ctx *current_decrypt;
+	u16 target_epoch;
+	int ret;
+
+	if (!ks->epoch_format)
+		return 0;
+
+	/* current key means no promotion is needed */
+	current_decrypt = rcu_access_pointer(ks->decrypt);
+	if (likely(decrypt == current_decrypt))
+		return 0;
+
+	/* take a stable reference to distinguish retiring from future keys */
+	if (unlikely(ovpn_key_ctx_get(&current_decrypt, &ks->decrypt)))
+		return 0;
+	/* retiring or older packets do not move rx forward */
+	if (likely(decrypt->epoch <= current_decrypt->epoch)) {
+		ovpn_key_ctx_put(current_decrypt);
+		return 0;
+	}
+	ovpn_key_ctx_put(current_decrypt);
+
+	target_epoch = decrypt->epoch;
+	/* keep enough epoch space for the future-key ring after promotion */
+	if (unlikely(target_epoch + OVPN_EPOCH_FUTURE_KEYS_COUNT >=
+		     OVPN_MAX_EPOCH))
+		return -ERANGE;
+
+	/* a future key is promoted only after successful authentication */
+	ret = ovpn_advance_decrypt_key(ks, target_epoch);
+	if (unlikely(ret == -EALREADY || ret == -EINPROGRESS))
+		return 0;
+	if (unlikely(ret))
+		net_warn_ratelimited("%s: decrypt: cannot advance key to epoch %u\n",
+				     netdev_name(peer->ovpn->dev),
+				     target_epoch);
+
+	return 0;
+}
+
 void ovpn_decrypt_post(void *data, int ret)
 {
 	struct ovpn_pktid_recv *pktid_recv;
@@ -141,9 +320,12 @@ void ovpn_decrypt_post(void *data, int ret)
 	kfree(ovpn_skb_cb(skb)->crypto_tmp);
 
 	if (unlikely(ret == -EBADMSG)) {
-		if (key && unlikely(ovpn_aead_decrypt_failure_record(key)) &&
-		    !ks->epoch_format)
-			ovpn_nl_key_swap_notify(peer, ks->key_id);
+		if (key && unlikely(ovpn_aead_decrypt_failure_record(key))) {
+			if (!ks->epoch_format)
+				ovpn_nl_key_swap_notify(peer, ks->key_id);
+			else
+				ovpn_rx_request_tx_rotation(ks, key);
+		}
 		goto drop;
 	}
 
@@ -175,6 +357,12 @@ void ovpn_decrypt_post(void *data, int ret)
 	}
 	if (unlikely(payload_len < 0))
 		goto drop;
+
+	if (unlikely(ovpn_check_rotate_keys(peer, ks, key) < 0)) {
+		if (ovpn_crypto_kill_key(&peer->crypto, ks->key_id))
+			ovpn_nl_key_swap_notify(peer, ks->key_id);
+		goto drop;
+	}
 
 	if (ks->tail_tag_size &&
 	    unlikely(pskb_trim(skb, skb->len - ks->tail_tag_size)))
