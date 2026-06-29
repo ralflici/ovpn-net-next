@@ -898,7 +898,7 @@ int ovpn_nl_key_new_doit(struct sk_buff *skb, struct genl_info *info)
 {
 	struct nlattr *attrs[OVPN_A_KEYCONF_MAX + 1];
 	struct ovpn_priv *ovpn = info->user_ptr[0];
-	struct ovpn_peer_key_reset pkr;
+	struct ovpn_peer_key_reset pkr = {};
 	struct ovpn_peer *peer;
 	u32 peer_id;
 	int ret;
@@ -933,12 +933,14 @@ int ovpn_nl_key_new_doit(struct sk_buff *skb, struct genl_info *info)
 	pkr.key.cipher_alg = nla_get_u32(attrs[OVPN_A_KEYCONF_CIPHER_ALG]);
 
 	ret = ovpn_nl_get_key_dir(info, attrs[OVPN_A_KEYCONF_ENCRYPT_DIR],
-				  pkr.key.cipher_alg, &pkr.key.encrypt);
+				  pkr.key.cipher_alg,
+				  &pkr.key.direct.encrypt);
 	if (ret < 0)
 		return ret;
 
 	ret = ovpn_nl_get_key_dir(info, attrs[OVPN_A_KEYCONF_DECRYPT_DIR],
-				  pkr.key.cipher_alg, &pkr.key.decrypt);
+				  pkr.key.cipher_alg,
+				  &pkr.key.direct.decrypt);
 	if (ret < 0)
 		return ret;
 

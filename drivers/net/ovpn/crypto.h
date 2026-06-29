@@ -14,6 +14,7 @@
 #include <linux/rcupdate.h>
 #include <linux/workqueue.h>
 
+#include "crypto_epoch.h"
 #include "crypto_limits.h"
 #include "pktid.h"
 #include "proto.h"
@@ -26,12 +27,28 @@ struct ovpn_key_direction {
 	size_t nonce_tail_size; /* only needed for GCM modes */
 };
 
-/* direct-key material for a primary or secondary slot */
+/* PRK material imported from userspace to derive epoch data keys */
+struct ovpn_epoch_prk {
+	const u8 *key;
+	size_t key_size;
+	unsigned int cipher_key_len;
+};
+
+/* key material for a primary or secondary slot */
 struct ovpn_key_config {
 	enum ovpn_cipher_alg cipher_alg;
 	u8 key_id;
-	struct ovpn_key_direction encrypt;
-	struct ovpn_key_direction decrypt;
+	bool use_epoch_keys;
+	union {
+		struct {
+			struct ovpn_key_direction encrypt;
+			struct ovpn_key_direction decrypt;
+		} direct;
+		struct {
+			struct ovpn_epoch_prk encrypt;
+			struct ovpn_epoch_prk decrypt;
+		} epoch;
+	};
 };
 
 /* used to pass settings from netlink to the crypto engine */
@@ -42,6 +59,7 @@ struct ovpn_peer_key_reset {
 
 /* state for one concrete AEAD key direction */
 struct ovpn_key_ctx {
+	u16 epoch;
 	struct crypto_aead *tfm;
 	u8 implicit_iv[OVPN_NONCE_SIZE];
 	struct ovpn_pktid_xmit pktid_xmit ____cacheline_aligned_in_smp;
@@ -63,11 +81,29 @@ struct ovpn_crypto_key_slot {
 	u8 key_id;
 	enum ovpn_cipher_alg cipher_alg;
 	struct ovpn_limit xmit_limit;
+	const char *alg_name;
 	bool epoch_format;
 	unsigned int aad_size;
 	unsigned int pktid_size;
+
+	struct ovpn_epoch_key epoch_key_send;
+	struct ovpn_epoch_key epoch_key_recv;
+
 	struct ovpn_key_ctx __rcu *encrypt;
 	struct ovpn_key_ctx __rcu *decrypt;
+	struct ovpn_key_ctx __rcu *retiring_key;
+
+	struct ovpn_future_keys future_tx_keys;
+	struct ovpn_future_keys future_rx_keys;
+
+	struct work_struct tx_refill;
+	struct work_struct rx_refill;
+
+	/* protects encrypt and future_tx_keys */
+	spinlock_t tx_lock;
+	/* protects decrypt, retiring_key and future_rx_keys */
+	spinlock_t rx_lock;
+
 	struct work_struct free_work;
 	unsigned long rcu_state;
 	struct percpu_ref refcount;
@@ -225,5 +261,15 @@ int ovpn_crypto_config_get(struct ovpn_crypto_state *cs,
 			   struct ovpn_key_config *keyconf);
 
 bool ovpn_crypto_kill_key(struct ovpn_crypto_state *cs, u8 key_id);
+
+void ovpn_schedule_refill(struct ovpn_crypto_key_slot *ks, bool encrypt);
+
+struct ovpn_key_ctx *
+ovpn_key_ctx_create_direct(bool encrypt, const char *alg_name,
+			   const struct ovpn_key_direction *dir);
+
+struct ovpn_key_ctx *
+ovpn_key_ctx_create_epoch(bool encrypt, const char *alg_name,
+			  struct ovpn_epoch_key *epoch_key);
 
 #endif /* _NET_OVPN_OVPNCRYPTO_H_ */
