@@ -43,7 +43,8 @@ ovpn_mark_prepare_network() {
 	for p in $(seq 1 3); do
 		ovpn_cmd_ok "install server key for peer ${p}" \
 			ip netns exec ovpn_peer0 "${OVPN_CLI}" new_key tun0 \
-				"${p}" 1 0 "${OVPN_ALG}" 0 data64.key
+				"${p}" 1 0 "${OVPN_ALG}" "${OVPN_KEY_TYPE}" \
+				0 data64.key
 	done
 
 	for p in $(seq 1 3); do

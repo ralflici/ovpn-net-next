@@ -12,6 +12,7 @@ OVPN_TCP_PEERS_FILE=${OVPN_TCP_PEERS_FILE:-tcp_peers.txt}
 OVPN_CLI=${OVPN_CLI:-${OVPN_COMMON_DIR}/ovpn-cli}
 OVPN_YNL=${OVPN_YNL:-${OVPN_COMMON_DIR}/../../../../net/ynl/pyynl/cli.py}
 OVPN_ALG=${OVPN_ALG:-aes}
+OVPN_KEY_TYPE=${OVPN_KEY_TYPE:-direct}
 OVPN_PROTO=${OVPN_PROTO:-UDP}
 OVPN_FLOAT=${OVPN_FLOAT:-0}
 OVPN_SYMMETRIC_ID=${OVPN_SYMMETRIC_ID:-0}
@@ -184,14 +185,26 @@ ovpn_build_capture_filter() {
 		# address. The IPv6 branch assumes there are no extension
 		# headers in the outer packet.
 		if [[ "${2}" == *:* ]]; then
-			printf "ip6 and ip6[6] = 17 and ip6[48:4] = %s" "${1}"
+			printf "ip6 and ip6[6] = 17 and ip6[48:4] = %s" \
+				"${1}"
+			if [ "${OVPN_KEY_TYPE}" == "epoch" ]; then
+				printf " and ip6[52:2] = 0x0001"
+			fi
 		else
 			printf "ip and udp[8:4] = %s" "${1}"
+			if [ "${OVPN_KEY_TYPE}" == "epoch" ]; then
+				printf " and udp[12:2] = 0x0001"
+			fi
 		fi
 	else
 		# openvpn over TCP prepends a 2-byte packet length ahead of the
 		# DATA_V2 opcode, so skip it before matching the payload header
-		printf "ip and tcp[(((tcp[12] & 0xf0) >> 2) + 2):4] = %s" "${1}"
+		printf "ip and tcp[(((tcp[12] & 0xf0) >> 2) + 2):4] = %s" \
+			"${1}"
+		if [ "${OVPN_KEY_TYPE}" == "epoch" ]; then
+			printf " and tcp[(((tcp[12] & 0xf0) >> 2) + 6):2] = "
+			printf "0x0001"
+		fi
 	fi
 }
 
@@ -222,8 +235,8 @@ ovpn_add_peer() {
 
 			for p in $(seq 1 ${OVPN_NUM_PEERS}); do
 				ip netns exec "${server_ns}" ${OVPN_CLI} \
-					new_key tun0 ${p} 1 0 ${OVPN_ALG} 0 \
-					data64.key
+					new_key tun0 ${p} 1 0 ${OVPN_ALG} \
+					${OVPN_KEY_TYPE} 0 data64.key
 			done
 		else
 			peer_ns="ovpn_peer${1}"
@@ -245,7 +258,8 @@ ovpn_add_peer() {
 				tun${1} ${PEER_ID} ${TX_ID} ${LPORT} ${RADDR} \
 				${RPORT}
 			ip netns exec "${peer_ns}" ${OVPN_CLI} new_key tun${1} \
-				${PEER_ID} 1 0 ${OVPN_ALG} 1 data64.key
+				${PEER_ID} 1 0 ${OVPN_ALG} ${OVPN_KEY_TYPE} \
+				1 data64.key
 		fi
 	else
 		if [ ${1} -eq 0 ]; then
@@ -254,7 +268,8 @@ ovpn_add_peer() {
 				for p in $(seq 1 ${OVPN_NUM_PEERS}); do
 					ip netns exec "${server_ns}" \
 						${OVPN_CLI} new_key tun0 ${p} \
-						1 0 ${OVPN_ALG} 0 data64.key
+						1 0 ${OVPN_ALG} \
+						${OVPN_KEY_TYPE} 0 data64.key
 				done
 			}) &
 			sleep 5
@@ -269,7 +284,8 @@ ovpn_add_peer() {
 				TX_ID=${1}
 			fi
 			ip netns exec "${peer_ns}" ${OVPN_CLI} connect tun${1} \
-				${PEER_ID} ${TX_ID} 10.10.${1}.1 1 data64.key
+				${PEER_ID} ${TX_ID} 10.10.${1}.1 1 \
+				${OVPN_KEY_TYPE} data64.key
 		fi
 	fi
 }

@@ -67,14 +67,15 @@ ovpn_run_basic_traffic() {
 	local tcpdump_timeout="1.5s"
 
 	for p in $(seq 1 ${OVPN_NUM_PEERS}); do
-		# The first part of the data packet header consists of:
+		# The tcpdump filters match the cleartext data packet prefix:
 		# - TCP only: 2 bytes for the packet length
 		# - 5 bits for opcode ("9" for DATA_V2)
 		# - 3 bits for key-id ("0" at this point)
-		# - 12 bytes for peer-id:
+		# - 24 bits for peer-id:
 		#     - with asymmetric ID: "${p}" one way and "${p} + 9" the
 		#	other way
 		#     - with symmetric ID: "${p}" both ways
+		# - epoch keys only: 2 bytes for epoch ("1" at this point)
 		header1=$(printf "0x4800000%x" ${p})
 		header2=$(printf "0x4800000%x" $((p + OVPN_ID_OFFSET)))
 		raddr=""
@@ -152,11 +153,12 @@ ovpn_run_key_rollover() {
 		peer_ns="ovpn_peer${p}"
 		ovpn_cmd_ok "add secondary key on peer0 for peer ${p}" \
 			ip netns exec ovpn_peer0 ${OVPN_CLI} new_key tun0 \
-				${p} 2 1 ${OVPN_ALG} 0 data64.key
+				${p} 2 1 ${OVPN_ALG} ${OVPN_KEY_TYPE} \
+				0 data64.key
 		ovpn_cmd_ok "add secondary key on peer${p} for peer ${p}" \
 			ip netns exec "${peer_ns}" ${OVPN_CLI} new_key tun${p} \
-				$((p + OVPN_ID_OFFSET)) 2 1 ${OVPN_ALG} 1 \
-				data64.key
+				$((p + OVPN_ID_OFFSET)) 2 1 ${OVPN_ALG} \
+				${OVPN_KEY_TYPE} 1 data64.key
 		ovpn_cmd_ok "swap keys on peer${p}" \
 			ip netns exec "${peer_ns}" ${OVPN_CLI} swap_keys \
 				tun${p} $((p + OVPN_ID_OFFSET))

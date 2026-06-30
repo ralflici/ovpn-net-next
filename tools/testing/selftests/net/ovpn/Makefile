@@ -36,6 +36,8 @@ TEST_PROGS := \
 	test-chachapoly.sh \
 	test-close-socket-tcp.sh \
 	test-close-socket.sh \
+	test-epoch-tcp.sh \
+	test-epoch.sh \
 	test-float.sh \
 	test-large-mtu.sh \
 	test-mark.sh \

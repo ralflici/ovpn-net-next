@@ -61,6 +61,11 @@ enum ovpn_key_direction {
 	KEY_DIR_OUT,
 };
 
+enum ovpn_key_type {
+	KEY_TYPE_DIRECT = 0,
+	KEY_TYPE_EPOCH,
+};
+
 #define KEY_LEN (256 / 8)
 #define NONCE_LEN 8
 
@@ -130,6 +135,7 @@ struct ovpn_ctx {
 	__u32 keepalive_interval;
 	__u32 keepalive_timeout;
 
+	enum ovpn_key_type key_type;
 	enum ovpn_key_direction key_dir;
 	enum ovpn_key_slot key_slot;
 	int key_id;
@@ -445,6 +451,18 @@ static int ovpn_parse_cipher(const char *cipher, struct ovpn_ctx *ctx)
 		ctx->cipher = OVPN_CIPHER_ALG_CHACHA20_POLY1305;
 	else if (strcmp(cipher, "none") == 0)
 		ctx->cipher = OVPN_CIPHER_ALG_NONE;
+	else
+		return -ENOTSUP;
+
+	return 0;
+}
+
+static int ovpn_parse_key_type(const char *type, struct ovpn_ctx *ctx)
+{
+	if (strcmp(type, "direct") == 0)
+		ctx->key_type = KEY_TYPE_DIRECT;
+	else if (strcmp(type, "epoch") == 0)
+		ctx->key_type = KEY_TYPE_EPOCH;
 	else
 		return -ENOTSUP;
 
@@ -921,9 +939,38 @@ nla_put_failure:
 	return ret;
 }
 
+static int ovpn_put_direct_key(struct nl_msg *msg, int attr, const __u8 *key,
+			       const __u8 *nonce)
+{
+	struct nlattr *key_dir;
+
+	key_dir = nla_nest_start(msg, attr);
+	NLA_PUT(msg, OVPN_A_KEYDIR_CIPHER_KEY, KEY_LEN, key);
+	NLA_PUT(msg, OVPN_A_KEYDIR_NONCE_TAIL, NONCE_LEN, nonce);
+	nla_nest_end(msg, key_dir);
+
+	return 0;
+nla_put_failure:
+	return -1;
+}
+
+static int ovpn_put_epoch_key(struct nl_msg *msg, int attr, const __u8 *key)
+{
+	struct nlattr *epoch;
+
+	epoch = nla_nest_start(msg, attr);
+	NLA_PUT(msg, OVPN_A_EPOCH_KEY, KEY_LEN, key);
+	NLA_PUT_U32(msg, OVPN_A_EPOCH_CIPHER_KEY_LEN, KEY_LEN);
+	nla_nest_end(msg, epoch);
+
+	return 0;
+nla_put_failure:
+	return -1;
+}
+
 static int ovpn_new_key(struct ovpn_ctx *ovpn)
 {
-	struct nlattr *keyconf, *key_dir;
+	struct nlattr *keyconf;
 	struct nl_ctx *ctx;
 	int ret = -1;
 
@@ -937,15 +984,37 @@ static int ovpn_new_key(struct ovpn_ctx *ovpn)
 	NLA_PUT_U32(ctx->nl_msg, OVPN_A_KEYCONF_KEY_ID, ovpn->key_id);
 	NLA_PUT_U32(ctx->nl_msg, OVPN_A_KEYCONF_CIPHER_ALG, ovpn->cipher);
 
-	key_dir = nla_nest_start(ctx->nl_msg, OVPN_A_KEYCONF_ENCRYPT_DIR);
-	NLA_PUT(ctx->nl_msg, OVPN_A_KEYDIR_CIPHER_KEY, KEY_LEN, ovpn->key_enc);
-	NLA_PUT(ctx->nl_msg, OVPN_A_KEYDIR_NONCE_TAIL, NONCE_LEN, ovpn->nonce);
-	nla_nest_end(ctx->nl_msg, key_dir);
+	switch (ovpn->key_type) {
+	case KEY_TYPE_DIRECT:
+		ret = ovpn_put_direct_key(ctx->nl_msg,
+					  OVPN_A_KEYCONF_ENCRYPT_DIR,
+					  ovpn->key_enc, ovpn->nonce);
+		if (ret)
+			goto nla_put_failure;
 
-	key_dir = nla_nest_start(ctx->nl_msg, OVPN_A_KEYCONF_DECRYPT_DIR);
-	NLA_PUT(ctx->nl_msg, OVPN_A_KEYDIR_CIPHER_KEY, KEY_LEN, ovpn->key_dec);
-	NLA_PUT(ctx->nl_msg, OVPN_A_KEYDIR_NONCE_TAIL, NONCE_LEN, ovpn->nonce);
-	nla_nest_end(ctx->nl_msg, key_dir);
+		ret = ovpn_put_direct_key(ctx->nl_msg,
+					  OVPN_A_KEYCONF_DECRYPT_DIR,
+					  ovpn->key_dec, ovpn->nonce);
+		if (ret)
+			goto nla_put_failure;
+		break;
+	case KEY_TYPE_EPOCH:
+		ret = ovpn_put_epoch_key(ctx->nl_msg,
+					 OVPN_A_KEYCONF_ENCRYPT_EPOCH,
+					 ovpn->key_enc);
+		if (ret)
+			goto nla_put_failure;
+
+		ret = ovpn_put_epoch_key(ctx->nl_msg,
+					 OVPN_A_KEYCONF_DECRYPT_EPOCH,
+					 ovpn->key_dec);
+		if (ret)
+			goto nla_put_failure;
+		break;
+	default:
+		ret = -EINVAL;
+		goto nla_put_failure;
+	}
 
 	nla_nest_end(ctx->nl_msg, keyconf);
 
@@ -1691,7 +1760,7 @@ static void usage(const char *cmd)
 		"\tipv6: whether the socket should listen to the IPv6 wildcard address\n");
 
 	fprintf(stderr,
-		"* connect <iface> <peer_id> <tx_id> <raddr> <rport> [key_file]: start connecting peer of TCP-based VPN session\n");
+		"* connect <iface> <peer_id> <tx_id> <raddr> <rport> [key_type key_file]: start connecting peer of TCP-based VPN session\n");
 	fprintf(stderr, "\tiface: ovpn interface name\n");
 	fprintf(stderr,
 		"\tpeer_id: peer ID found in data packets received from this peer\n");
@@ -1699,8 +1768,8 @@ static void usage(const char *cmd)
 		"\ttx_id: peer ID to be used when sending to this peer, 'none' for symmetric peer ID\n");
 	fprintf(stderr, "\traddr: peer IP address to connect to\n");
 	fprintf(stderr, "\trport: peer TCP port to connect to\n");
-	fprintf(stderr,
-		"\tkey_file: file containing the symmetric key for encryption\n");
+	fprintf(stderr, "\tkey_type: key type, supported: direct, epoch\n");
+	fprintf(stderr, "\tkey_file: file containing the pre-shared key\n");
 
 	fprintf(stderr,
 		"* new_peer <iface> <peer_id> <tx_id> <lport> <raddr> <rport> [vpnaddr]: add new peer\n");
@@ -1748,7 +1817,7 @@ static void usage(const char *cmd)
 		"\tpeer_id: peer ID of the peer to query. All peers are returned if omitted\n");
 
 	fprintf(stderr,
-		"* new_key <iface> <peer_id> <slot> <key_id> <cipher> <key_dir> <key_file>: set data channel key\n");
+		"* new_key <iface> <peer_id> <slot> <key_id> <cipher> <key_type> <key_dir> <key_file>: set data channel key\n");
 	fprintf(stderr, "\tiface: ovpn interface name\n");
 	fprintf(stderr,
 		"\tpeer_id: peer ID of the peer to configure the key for\n");
@@ -1756,6 +1825,7 @@ static void usage(const char *cmd)
 	fprintf(stderr, "\tkey_id: an ID from 0 to 7\n");
 	fprintf(stderr,
 		"\tcipher: cipher to use, supported: aes (AES-GCM), chachapoly (CHACHA20POLY1305)\n");
+	fprintf(stderr, "\tkey_type: key type, supported: direct, epoch\n");
 	fprintf(stderr,
 		"\tkey_dir: key direction, must 0 on one host and 1 on the other\n");
 	fprintf(stderr, "\tkey_file: file containing the pre-shared key\n");
@@ -2249,12 +2319,19 @@ static int ovpn_parse_cmd_args(struct ovpn_ctx *ovpn, int argc, char *argv[])
 		}
 
 		if (argc > 7) {
+			if (argc < 9)
+				return -EINVAL;
+
 			ovpn->key_slot = OVPN_KEY_SLOT_PRIMARY;
 			ovpn->key_id = 0;
 			ovpn->cipher = OVPN_CIPHER_ALG_AES_GCM;
 			ovpn->key_dir = KEY_DIR_OUT;
 
-			ret = ovpn_parse_key(argv[7], ovpn);
+			ret = ovpn_parse_key_type(argv[7], ovpn);
+			if (ret < 0)
+				return -1;
+
+			ret = ovpn_parse_key(argv[8], ovpn);
 			if (ret)
 				return -1;
 		}
@@ -2353,7 +2430,7 @@ static int ovpn_parse_cmd_args(struct ovpn_ctx *ovpn, int argc, char *argv[])
 		}
 		break;
 	case CMD_NEW_KEY:
-		if (argc < 9)
+		if (argc < 10)
 			return -EINVAL;
 
 		ovpn->peer_id = strtoul(argv[3], NULL, 10);
@@ -2376,11 +2453,15 @@ static int ovpn_parse_cmd_args(struct ovpn_ctx *ovpn, int argc, char *argv[])
 		if (ret < 0)
 			return -1;
 
-		ret = ovpn_parse_key_direction(argv[7], ovpn);
+		ret = ovpn_parse_key_type(argv[7], ovpn);
 		if (ret < 0)
 			return -1;
 
-		ret = ovpn_parse_key(argv[8], ovpn);
+		ret = ovpn_parse_key_direction(argv[8], ovpn);
+		if (ret < 0)
+			return -1;
+
+		ret = ovpn_parse_key(argv[9], ovpn);
 		if (ret)
 			return -1;
 		break;
@@ -2444,6 +2525,7 @@ int main(int argc, char *argv[])
 	memset(&ovpn, 0, sizeof(ovpn));
 	ovpn.sa_family = AF_UNSPEC;
 	ovpn.cipher = OVPN_CIPHER_ALG_NONE;
+	ovpn.key_type = KEY_TYPE_DIRECT;
 
 	ovpn.cmd = ovpn_parse_cmd(argv[1]);
 	if (ovpn.cmd == CMD_INVALID) {
