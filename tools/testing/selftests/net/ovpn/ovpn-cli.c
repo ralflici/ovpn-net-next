@@ -10,6 +10,7 @@
 #include <stdio.h>
 #include <inttypes.h>
 #include <stdbool.h>
+#include <stdlib.h>
 #include <string.h>
 #include <errno.h>
 #include <unistd.h>
@@ -543,7 +544,17 @@ static int ovpn_socket(struct ovpn_ctx *ctx, sa_family_t family, int proto)
 		}
 	}
 
-	ret = bind(s, (struct sockaddr *)&local_sock, sock_len);
+	/*
+	 * Persistent test instances can deliberately leave a UDP socket
+	 * unbound. This is useful for exercising how ovpn handles a socket
+	 * whose state is later changed by its userspace owner.
+	 */
+	if (proto != IPPROTO_UDP || !getenv("OVPN_CLI_PERSISTENT") ||
+	    ctx->lport) {
+		ret = bind(s, (struct sockaddr *)&local_sock, sock_len);
+	} else {
+		ret = 0;
+	}
 	if (ret < 0) {
 		perror("cannot bind socket");
 		goto err_socket;
@@ -1966,17 +1977,81 @@ static enum ovpn_cmd ovpn_parse_cmd(const char *cmd)
 	return CMD_INVALID;
 }
 
-/* Send process to background and waits for signal.
+/* Keep a socket-owning command alive.
  *
- * This helper is called at the end of commands
- * creating sockets, so that the latter stay alive
- * along with the process that created them.
+ * This helper is called at the end of commands creating sockets, so that the
+ * latter stay alive along with the process that created them. By default the
+ * process is detached and waits for a signal, as it did before.
  *
- * A signal is expected to be delivered in order to
- * terminate the waiting processes
+ * When OVPN_CLI_PERSISTENT is set, keep the process in the foreground and
+ * accept commands from standard input. This lets a selftest retain the socket
+ * while issuing commands to the process that owns it.
  */
-static void ovpn_waitbg(void)
+static int ovpn_persistent_command(struct ovpn_ctx *ovpn, const char *command)
 {
+	struct sockaddr_in6 local = { .sin6_family = AF_INET6 };
+	struct sockaddr_in6 addr = { .sin6_family = AF_INET6 };
+	struct sockaddr sa = { .sa_family = AF_UNSPEC };
+	int family = AF_INET;
+	int opt = 1;
+	int ret;
+
+	if (!strcmp(command, "DISCONNECT")) {
+		ret = connect(ovpn->socket, &sa, sizeof(sa));
+	} else if (!strcmp(command, "V6ONLY")) {
+		ret = setsockopt(ovpn->socket, IPPROTO_IPV6, IPV6_V6ONLY, &opt,
+				 sizeof(opt));
+	} else if (!strcmp(command, "ADDRFORM")) {
+		if (inet_pton(AF_INET6, "::ffff:127.0.0.1",
+			      &local.sin6_addr) != 1)
+			return -EINVAL;
+
+		ret = bind(ovpn->socket, (struct sockaddr *)&local,
+			   sizeof(local));
+		if (ret)
+			return ret;
+
+		if (inet_pton(AF_INET6, "::ffff:127.0.0.1",
+			      &addr.sin6_addr) != 1)
+			return -EINVAL;
+		addr.sin6_port = htons(1);
+
+		ret = connect(ovpn->socket, (struct sockaddr *)&addr,
+			      sizeof(addr));
+		if (!ret)
+			ret = setsockopt(ovpn->socket, IPPROTO_IPV6,
+					 IPV6_ADDRFORM,
+					 &family, sizeof(family));
+	} else {
+		return -ENOENT;
+	}
+
+	return ret;
+}
+
+static void ovpn_waitbg(struct ovpn_ctx *ovpn)
+{
+	char command[32];
+	int ret;
+
+	if (getenv("OVPN_CLI_PERSISTENT")) {
+		puts("READY");
+		fflush(stdout);
+
+		while (fgets(command, sizeof(command), stdin)) {
+			command[strcspn(command, "\n")] = '\0';
+			ret = ovpn_persistent_command(ovpn, command);
+			if (!ret)
+				puts("OK");
+			else if (ret == -ENOENT)
+				puts("UNKNOWN");
+			else
+				puts("ERROR");
+			fflush(stdout);
+		}
+		return;
+	}
+
 	daemon(1, 1);
 	pause();
 }
@@ -2055,7 +2130,7 @@ static int ovpn_run_cmd(struct ovpn_ctx *ovpn)
 			if (ret < 0)
 				break;
 		}
-		ovpn_waitbg();
+		ovpn_waitbg(ovpn);
 		break;
 	case CMD_CONNECT:
 		ret = ovpn_connect(ovpn);
@@ -2080,7 +2155,7 @@ static int ovpn_run_cmd(struct ovpn_ctx *ovpn)
 		}
 
 		ret = ovpn_send_tcp_data(ovpn->socket);
-		ovpn_waitbg();
+		ovpn_waitbg(ovpn);
 		break;
 	case CMD_NEW_PEER:
 		ret = ovpn_udp_socket(ovpn, AF_INET6);
@@ -2088,7 +2163,7 @@ static int ovpn_run_cmd(struct ovpn_ctx *ovpn)
 			return ret;
 
 		ret = ovpn_new_peer(ovpn, false);
-		ovpn_waitbg();
+		ovpn_waitbg(ovpn);
 		break;
 	case CMD_NEW_MULTI_PEER:
 		ret = ovpn_udp_socket(ovpn, AF_INET6);
@@ -2126,7 +2201,7 @@ static int ovpn_run_cmd(struct ovpn_ctx *ovpn)
 				return ret;
 			}
 		}
-		ovpn_waitbg();
+		ovpn_waitbg(ovpn);
 		break;
 	case CMD_SET_PEER:
 		ret = ovpn_set_peer(ovpn);
