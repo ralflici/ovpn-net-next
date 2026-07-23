@@ -1966,18 +1966,19 @@ static enum ovpn_cmd ovpn_parse_cmd(const char *cmd)
 	return CMD_INVALID;
 }
 
-/* Send process to background and waits for signal.
+/* Wait for a signal while keeping the socket open.
  *
  * This helper is called at the end of commands
  * creating sockets, so that the latter stay alive
- * along with the process that created them.
+ * along with the process that created them.  The caller is
+ * responsible for putting ovpn-cli in the background, which keeps
+ * the process observable and lets the selftest retain its PID.
  *
  * A signal is expected to be delivered in order to
  * terminate the waiting processes
  */
-static void ovpn_waitbg(void)
+static void ovpn_wait(void)
 {
-	daemon(1, 1);
 	pause();
 }
 
@@ -2055,7 +2056,7 @@ static int ovpn_run_cmd(struct ovpn_ctx *ovpn)
 			if (ret < 0)
 				break;
 		}
-		ovpn_waitbg();
+		ovpn_wait();
 		break;
 	case CMD_CONNECT:
 		ret = ovpn_connect(ovpn);
@@ -2080,7 +2081,7 @@ static int ovpn_run_cmd(struct ovpn_ctx *ovpn)
 		}
 
 		ret = ovpn_send_tcp_data(ovpn->socket);
-		ovpn_waitbg();
+		ovpn_wait();
 		break;
 	case CMD_NEW_PEER:
 		ret = ovpn_udp_socket(ovpn, AF_INET6);
@@ -2088,7 +2089,7 @@ static int ovpn_run_cmd(struct ovpn_ctx *ovpn)
 			return ret;
 
 		ret = ovpn_new_peer(ovpn, false);
-		ovpn_waitbg();
+		ovpn_wait();
 		break;
 	case CMD_NEW_MULTI_PEER:
 		ret = ovpn_udp_socket(ovpn, AF_INET6);
@@ -2126,7 +2127,7 @@ static int ovpn_run_cmd(struct ovpn_ctx *ovpn)
 				return ret;
 			}
 		}
-		ovpn_waitbg();
+		ovpn_wait();
 		break;
 	case CMD_SET_PEER:
 		ret = ovpn_set_peer(ovpn);

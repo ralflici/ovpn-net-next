@@ -26,6 +26,7 @@ OVPN_LAN_IP="11.11.11.11"
 
 declare -A OVPN_TMP_JSONS=()
 declare -A OVPN_LISTENER_PIDS=()
+declare -a OVPN_CLI_PIDS=()
 OVPN_CURRENT_STAGE=""
 
 ovpn_is_verbose() {
@@ -111,6 +112,15 @@ ovpn_run_bg() {
 	fi
 
 	printf -v "${pid_var}" '%s' "$!"
+}
+
+ovpn_start_cli() {
+	local netns="$1"
+	local pid
+
+	shift
+	ovpn_run_bg pid ip netns exec "${netns}" "${OVPN_CLI}" "$@"
+	OVPN_CLI_PIDS+=("${pid}")
 }
 
 ovpn_run_stage() {
@@ -216,7 +226,7 @@ ovpn_add_peer() {
 
 	if [ "${OVPN_PROTO}" == "UDP" ]; then
 		if [ ${1} -eq 0 ]; then
-			ip netns exec "${server_ns}" ${OVPN_CLI} \
+			ovpn_start_cli "${server_ns}" \
 				new_multi_peer tun0 1 ${M_ID} \
 				${OVPN_UDP_PEERS_FILE}
 
@@ -241,7 +251,7 @@ ovpn_add_peer() {
 				${OVPN_UDP_PEERS_FILE})
 			LPORT=$(awk "NR == ${1} {print \$6}" \
 				${OVPN_UDP_PEERS_FILE})
-			ip netns exec "${peer_ns}" ${OVPN_CLI} new_peer \
+			ovpn_start_cli "${peer_ns}" new_peer \
 				tun${1} ${PEER_ID} ${TX_ID} ${LPORT} ${RADDR} \
 				${RPORT}
 			ip netns exec "${peer_ns}" ${OVPN_CLI} new_key tun${1} \
@@ -249,15 +259,13 @@ ovpn_add_peer() {
 		fi
 	else
 		if [ ${1} -eq 0 ]; then
-			(ip netns exec "${server_ns}" ${OVPN_CLI} listen tun0 \
-				1 ${M_ID} ${OVPN_TCP_PEERS_FILE} && {
-				for p in $(seq 1 ${OVPN_NUM_PEERS}); do
-					ip netns exec "${server_ns}" \
-						${OVPN_CLI} new_key tun0 ${p} \
-						1 0 ${OVPN_ALG} 0 data64.key
-				done
-			}) &
+			ovpn_start_cli "${server_ns}" listen tun0 1 ${M_ID} \
+				${OVPN_TCP_PEERS_FILE}
 			sleep 5
+			for p in $(seq 1 ${OVPN_NUM_PEERS}); do
+				ip netns exec "${server_ns}" ${OVPN_CLI} new_key \
+					tun0 ${p} 1 0 ${OVPN_ALG} 0 data64.key
+			done
 		else
 			peer_ns="ovpn_peer${1}"
 			if [ "${OVPN_SYMMETRIC_ID}" -eq 1 ]; then
@@ -268,7 +276,7 @@ ovpn_add_peer() {
 					${OVPN_TCP_PEERS_FILE})
 				TX_ID=${1}
 			fi
-			ip netns exec "${peer_ns}" ${OVPN_CLI} connect tun${1} \
+			ovpn_start_cli "${peer_ns}" connect tun${1} \
 				${PEER_ID} ${TX_ID} 10.10.${1}.1 1 data64.key
 		fi
 	fi
@@ -337,8 +345,13 @@ ovpn_cleanup_peer_ns() {
 ovpn_cleanup() {
 	local peer
 
-	# some ovpn-cli processes sleep in background so they need manual poking
-	killall "$(basename "${OVPN_CLI}")" 2>/dev/null || true
+	for pid in "${OVPN_CLI_PIDS[@]}"; do
+		kill -TERM "${pid}" 2>/dev/null || true
+	done
+	for pid in "${OVPN_CLI_PIDS[@]}"; do
+		wait "${pid}" 2>/dev/null || true
+	done
+	OVPN_CLI_PIDS=()
 
 	for peer in "${!OVPN_LISTENER_PIDS[@]}"; do
 		ovpn_stop_listener "${peer}" 2>/dev/null
