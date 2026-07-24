@@ -86,25 +86,26 @@ void ovpn_socket_release(struct ovpn_peer *peer)
 	released = ovpn_socket_put(peer, sock);
 	release_sock(sock->sk);
 
+	if (!released)
+		return;
+
 	/* align all readers with sk_user_data being NULL */
 	synchronize_rcu();
 
 	/* following cleanup should happen with lock released */
-	if (released) {
-		if (sock->sk->sk_protocol == IPPROTO_UDP) {
-			netdev_put(sock->ovpn->dev, &sock->dev_tracker);
-		} else if (sock->sk->sk_protocol == IPPROTO_TCP) {
-			/* wait for TCP jobs to terminate */
-			ovpn_tcp_socket_wait_finish(sock);
-			ovpn_peer_put(sock->peer);
-		}
-		/* drop reference acquired in ovpn_socket_new() */
-		sock_put(sock->sk);
-		/* we can call plain kfree() because we already waited one RCU
-		 * period due to synchronize_rcu()
-		 */
-		kfree(sock);
+	if (sock->sk->sk_protocol == IPPROTO_UDP) {
+		netdev_put(sock->ovpn->dev, &sock->dev_tracker);
+	} else if (sock->sk->sk_protocol == IPPROTO_TCP) {
+		/* wait for TCP jobs to terminate */
+		ovpn_tcp_socket_wait_finish(sock);
+		ovpn_peer_put(sock->peer);
 	}
+	/* drop reference acquired in ovpn_socket_new() */
+	sock_put(sock->sk);
+	/* we can call plain kfree() because we already waited one RCU
+	 * period due to synchronize_rcu()
+	 */
+	kfree(sock);
 }
 
 static bool ovpn_socket_hold(struct ovpn_socket *sock)
