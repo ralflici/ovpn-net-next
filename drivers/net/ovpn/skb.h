@@ -18,12 +18,15 @@
 #include <linux/socket.h>
 #include <linux/types.h>
 
+struct ovpn_tx_batch;
+
 /**
  * struct ovpn_cb - ovpn skb control block
  * @peer: the peer this skb was received from/sent to
  * @ks: the crypto key slot used to encrypt/decrypt this skb
  * @crypto_tmp: pointer to temporary memory used for crypto operations
  *		containing the IV, the scatter gather list and the aead request
+ * @batch: optional UDP GSO batch which owns this skb
  * @payload_offset: offset in the skb where the payload starts
  * @nosignal: whether this skb should be sent with the MSG_NOSIGNAL flag (TCP)
  */
@@ -31,6 +34,7 @@ struct ovpn_cb {
 	struct ovpn_peer *peer;
 	struct ovpn_crypto_key_slot *ks;
 	void *crypto_tmp;
+	struct ovpn_tx_batch *batch;
 	unsigned int payload_offset;
 	bool nosignal;
 };
