@@ -10,6 +10,7 @@
 #ifndef _NET_OVPN_SKB_H_
 #define _NET_OVPN_SKB_H_
 
+#include <linux/atomic.h>
 #include <linux/in.h>
 #include <linux/in6.h>
 #include <linux/ip.h>
@@ -20,19 +21,35 @@
 
 /**
  * struct ovpn_cb - ovpn skb control block
- * @peer: the peer this skb was received from/sent to
- * @ks: the crypto key slot used to encrypt/decrypt this skb
  * @crypto_tmp: pointer to temporary memory used for crypto operations
  *		containing the IV, the scatter gather list and the aead request
+ * @peer: peer used by this crypto operation or owned by this aggregate
+ * @ks: crypto key slot used by this operation or owned by this aggregate
  * @payload_offset: offset in the skb where the payload starts
  * @nosignal: whether this skb should be sent with the MSG_NOSIGNAL flag (TCP)
+ * @batch: UDP GSO aggregate receiving this input skb's encrypted payload
+ * @batch_state: completion state owned by a UDP GSO aggregate
  */
 struct ovpn_cb {
+	void *crypto_tmp;
 	struct ovpn_peer *peer;
 	struct ovpn_crypto_key_slot *ks;
-	void *crypto_tmp;
-	unsigned int payload_offset;
-	bool nosignal;
+
+	/* Ordinary encryption leaves this union zeroed. Decryption and TCP use
+	 * their ordinary fields, a UDP GSO input stores its output aggregate,
+	 * and that aggregate uses the same space to coordinate its completions.
+	 */
+	union {
+		struct {
+			unsigned int payload_offset;
+			bool nosignal;
+		};
+		struct sk_buff *batch;
+		struct {
+			atomic_t pending;
+			atomic_t failed;
+		} batch_state;
+	};
 };
 
 static inline struct ovpn_cb *ovpn_skb_cb(struct sk_buff *skb)

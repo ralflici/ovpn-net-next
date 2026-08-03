@@ -40,16 +40,26 @@ static inline void ovpn_peer_stats_increment_rx(struct ovpn_peer_stats *stats,
 	ovpn_peer_stats_increment(&stats->rx, n);
 }
 
+static inline void ovpn_peer_stats_add_tx(struct ovpn_peer_stats *stats,
+					  const unsigned int bytes,
+					  unsigned int packets)
+{
+	atomic64_add(bytes, &stats->tx.bytes);
+	atomic64_add(packets, &stats->tx.packets);
+}
+
 static inline void ovpn_peer_stats_increment_tx(struct ovpn_peer_stats *stats,
 						const unsigned int n)
 {
-	ovpn_peer_stats_increment(&stats->tx, n);
+	ovpn_peer_stats_add_tx(stats, n, 1);
 }
 
-static inline void ovpn_dev_dstats_tx_dropped(struct net_device *dev)
+static inline void ovpn_dev_dstats_tx_dropped(struct net_device *dev,
+					      unsigned int packets)
 {
 	local_bh_disable();
-	dev_dstats_tx_dropped(dev);
+	while (packets--)
+		dev_dstats_tx_dropped(dev);
 	local_bh_enable();
 }
 
