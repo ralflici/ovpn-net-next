@@ -11,8 +11,10 @@
 #include <linux/skbuff.h>
 #include <linux/socket.h>
 #include <linux/udp.h>
+#include <linux/unaligned.h>
 #include <net/addrconf.h>
 #include <net/dst_cache.h>
+#include <net/gro.h>
 #include <net/route.h>
 #include <net/transp_v6.h>
 #include <net/udp.h>
@@ -26,6 +28,209 @@
 #include "proto.h"
 #include "socket.h"
 #include "udp.h"
+
+/* like UDP and TCP frag-list GRO */
+#define OVPN_UDP_GRO_CNT_MAX 64
+
+static bool ovpn_udp_gro_header(struct sk_buff *skb, u32 *header)
+{
+	const unsigned int offset = skb_gro_offset(skb);
+
+	/* GRO replaces its frag0 pointer after holding an skb, so keep the
+	 * openvpn header linear for later candidate comparisons
+	 */
+	if (!pskb_may_pull(skb, offset + OVPN_OPCODE_SIZE))
+		return false;
+
+	*header = get_unaligned_be32(skb->data + offset);
+	return true;
+}
+
+static struct sk_buff *ovpn_udp_gro_receive_fraglist(struct sock *sk,
+						     struct list_head *head,
+						     struct sk_buff *skb)
+{
+	const unsigned int gso_size = skb_gro_len(skb);
+	struct sk_buff *p, *pp = NULL;
+	u32 header, header2;
+	int ret = 0, nhoff;
+	bool flush;
+
+	if (!ovpn_udp_gro_header(skb, &header) ||
+	    FIELD_GET(OVPN_OPCODE_PKTTYPE_MASK, header) != OVPN_DATA_V2) {
+		NAPI_GRO_CB(skb)->flush = 1;
+		return NULL;
+	}
+
+	/* do not nest an existing GSO packet in the record list */
+	if (skb_is_gso(skb)) {
+		NAPI_GRO_CB(skb)->flush = 1;
+		return NULL;
+	}
+
+	list_for_each_entry(p, head, list) {
+		if (!NAPI_GRO_CB(p)->same_flow)
+			continue;
+
+		/* match opcode, key ID and peer ID */
+		if (!ovpn_udp_gro_header(p, &header2) || header != header2) {
+			NAPI_GRO_CB(p)->same_flow = 0;
+			continue;
+		}
+
+		/* GRO has already matched the outer addresses and UDP ports;
+		 * check the remaining outer IP fields
+		 */
+		nhoff = skb_transport_offset(p) -
+			NAPI_GRO_CB(p)->network_offset;
+		flush = __gro_receive_network_flush(udp_hdr(skb), udp_hdr(p), p,
+						    nhoff, false);
+
+		/* The first record determines the nominal GSO size. A shorter
+		 * final record may follow it, but a larger record cannot.
+		 * Checksum metadata must also be uniform because the aggregate
+		 * exposes only one checksum state.
+		 */
+		if (gso_size > skb_shinfo(p)->gso_size || flush ||
+		    skb->ip_summed != p->ip_summed ||
+		    skb->csum_level != p->csum_level) {
+			pp = p;
+		} else {
+			/* skb_gro_receive_list pulls the headers already
+			 * processed by GRO before linking this skb to the
+			 * record list so we have to manually preserve the
+			 * outer network header location for later handling
+			 */
+			nhoff = NAPI_GRO_CB(skb)->network_offset;
+			skb_set_network_header(skb, nhoff);
+			ret = skb_gro_receive_list(p, skb);
+		}
+
+		/* complete the aggregate if the append failed, or after
+		 * appending a shorter final record, or after reaching the
+		 * record-count limit
+		 */
+		if (ret || gso_size != skb_shinfo(p)->gso_size ||
+		    NAPI_GRO_CB(p)->count >= OVPN_UDP_GRO_CNT_MAX)
+			pp = p;
+
+		return pp;
+	}
+
+	return NULL;
+}
+
+static int ovpn_udp_gro_complete(struct sock *sk, struct sk_buff *skb,
+				 int nhoff)
+{
+	/* udp_gro_complete has already marked this as a UDP tunnel GSO packet.
+	 * Keep that type so UDP passes the aggregate directly to the encap cb,
+	 * where the original record skbs are detached.
+	 */
+	skb_shinfo(skb)->gso_segs = NAPI_GRO_CB(skb)->count;
+
+	/* Each outer UDP checksum was either validated (or accepted in case of
+	 * checksumless UDP) before its record was merged in
+	 * skb_gro_checksum_validate_zero_check.
+	 * The checksum in the aggregate cannot describe the concatenation of
+	 * independent UDP payloads, so we preserve the validation result.
+	 */
+	skb->ip_summed = CHECKSUM_UNNECESSARY;
+	skb->csum_level = 0;
+	skb->csum_valid = 0;
+
+	return 0;
+}
+
+/* skb_gro_receive_list keeps the first openvpn record in 'skb' and links the
+ * remaining records through fraglist. Here we segment by detaching that list
+ * before delivering the records individually, and remove the child skbs from
+ * the head skb's length and memory accounting so the head describes only the
+ * first record again.
+ */
+static struct sk_buff *ovpn_udp_gro_detach(struct sk_buff *skb)
+{
+	unsigned int data_len = 0, truesize = 0;
+	struct sk_buff *curr, *list;
+	int ret;
+
+	/* IP reassembly may also use fraglist, but it is not a record batch */
+	if (!skb_is_gso(skb) ||
+	    !(skb_shinfo(skb)->gso_type &
+	      (SKB_GSO_UDP_TUNNEL | SKB_GSO_UDP_TUNNEL_CSUM)))
+		return NULL;
+
+	if (unlikely(!skb_shinfo(skb)->frag_list))
+		return NULL;
+
+	/* packet taps may have cloned the aggregate before it reached UDP, so
+	 * make shared info private before removing its fraglist
+	 */
+	ret = skb_unclone(skb, GFP_ATOMIC);
+	if (unlikely(ret))
+		return ERR_PTR(ret);
+
+	list = skb_shinfo(skb)->frag_list;
+
+	for (curr = list; curr; curr = curr->next) {
+		data_len += curr->len;
+		truesize += curr->truesize;
+	}
+
+	skb_shinfo(skb)->frag_list = NULL;
+	skb->len -= data_len;
+	skb->data_len -= data_len;
+	skb->truesize -= truesize;
+
+	return list;
+}
+
+static void ovpn_udp_recv(struct ovpn_peer *peer, struct sk_buff *skb)
+{
+	struct sk_buff *list, *next;
+
+	list = ovpn_udp_gro_detach(skb);
+	if (IS_ERR(list)) {
+		ovpn_dev_dstats_rx_dropped(peer->ovpn->dev);
+		kfree_skb(skb);
+		ovpn_peer_put(peer);
+		return;
+	}
+	skb->next = list;
+
+	skb_list_walk_safe(skb, skb, next)
+	{
+		/* skb_unclone can leave fraglist children shared with a packet
+		 * tap, so make each skb header private before changing its
+		 * list pointer or control block. skb_cow_data makes the packet
+		 * data writable later in the decrypt path.
+		 */
+		skb = skb_share_check(skb, GFP_ATOMIC);
+		if (unlikely(!skb)) {
+			ovpn_dev_dstats_rx_dropped(peer->ovpn->dev);
+
+			/* carry the current record's peer reference to the
+			 * next record or release it at the end of the list
+			 */
+			if (!next)
+				ovpn_peer_put(peer);
+			continue;
+		}
+
+		skb_mark_not_on_list(skb);
+
+		/* keep the current reference alive for the next record before
+		 * handing this one to crypto
+		 */
+		if (next && unlikely(!ovpn_peer_hold(peer))) {
+			DEBUG_NET_WARN_ON_ONCE(1);
+			kfree_skb_list(next);
+			next = NULL;
+		}
+
+		ovpn_recv(peer, skb);
+	}
+}
 
 /* Retrieve the corresponding ovpn object from a UDP socket
  * rcu_read_lock must be held on entry
@@ -121,8 +326,7 @@ static int ovpn_udp_encap_recv(struct sock *sk, struct sk_buff *skb)
 
 	/* pop off outer UDP header */
 	__skb_pull(skb, sizeof(struct udphdr));
-	skb_mark_not_on_list(skb);
-	ovpn_recv(peer, skb);
+	ovpn_udp_recv(peer, skb);
 	return 0;
 
 drop:
@@ -408,6 +612,8 @@ int ovpn_udp_socket_attach(struct ovpn_socket *ovpn_sock, struct socket *sock,
 		.encap_type = UDP_ENCAP_OVPNINUDP,
 		.encap_rcv = ovpn_udp_encap_recv,
 		.encap_destroy = ovpn_udp_encap_destroy,
+		.gro_receive = ovpn_udp_gro_receive_fraglist,
+		.gro_complete = ovpn_udp_gro_complete,
 	};
 	struct ovpn_socket *old_data;
 	int ret;
@@ -454,6 +660,8 @@ void ovpn_udp_socket_detach(struct ovpn_socket *ovpn_sock)
 {
 	struct sock *sk = ovpn_sock->sk;
 
+	udp_tunnel_cleanup_gro(sk);
+
 	/* Re-enable multicast loopback */
 	inet_set_bit(MC_LOOP, sk);
 	/* Disable CHECKSUM_UNNECESSARY to CHECKSUM_COMPLETE conversion */
@@ -462,6 +670,8 @@ void ovpn_udp_socket_detach(struct ovpn_socket *ovpn_sock)
 	WRITE_ONCE(udp_sk(sk)->encap_type, 0);
 	WRITE_ONCE(udp_sk(sk)->encap_rcv, NULL);
 	WRITE_ONCE(udp_sk(sk)->encap_destroy, NULL);
+	WRITE_ONCE(udp_sk(sk)->gro_receive, NULL);
+	WRITE_ONCE(udp_sk(sk)->gro_complete, NULL);
 
 	rcu_assign_sk_user_data(sk, NULL);
 }

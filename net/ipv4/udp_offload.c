@@ -40,7 +40,8 @@ struct udp_tunnel_type_entry {
 #define UDP_MAX_TUNNEL_TYPES (IS_ENABLED(CONFIG_GENEVE) + \
 			      IS_ENABLED(CONFIG_VXLAN) * 2 + \
 			      IS_ENABLED(CONFIG_NET_FOU) * 2 + \
-			      IS_ENABLED(CONFIG_XFRM) * 2)
+			      IS_ENABLED(CONFIG_XFRM) * 2 + \
+			      IS_ENABLED(CONFIG_OVPN))
 
 DEFINE_STATIC_CALL(udp_tunnel_gro_rcv, dummy_gro_rcv);
 static DEFINE_STATIC_KEY_FALSE(udp_tunnel_static_call);
