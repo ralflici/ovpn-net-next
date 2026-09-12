@@ -388,6 +388,28 @@ static bool ovpn_encrypt_one(struct ovpn_peer *peer, struct sk_buff *skb)
 	return true;
 }
 
+static void ovpn_skb_prefetch_frag(const struct sk_buff *skb)
+{
+	unsigned long addr, end;
+	const skb_frag_t *frag;
+
+	if (!skb_shinfo(skb)->nr_frags)
+		return;
+
+	frag = &skb_shinfo(skb)->frags[0];
+	/* prefetch requires a directly accessible kernel virtual address */
+	addr = (unsigned long)skb_frag_address_safe(frag);
+	if (!addr)
+		return;
+
+	end = addr + skb_frag_size(frag);
+	/* the linear head was just touched by segmentation, so prefetch the
+	 * first shared payload frag without repeating crypto's full sg walk
+	 */
+	for (; addr < end; addr = ALIGN(addr + 1, L1_CACHE_BYTES))
+		prefetch((void *)addr);
+}
+
 static bool ovpn_encrypt_gso_queue(struct sk_buff_head *skbs,
 				   struct ovpn_peer *peer,
 				   struct sk_buff *batch,
@@ -428,6 +450,12 @@ static bool ovpn_encrypt_gso_queue(struct sk_buff_head *skbs,
 	for (i = 0; i < segments; i++) {
 		skb = __skb_dequeue(skbs);
 		len = skb->len + OVPN_DATA_V2_OVERHEAD;
+
+		/* overlap fetching the next segment's shared payload with
+		 * encryption of the current segment
+		 */
+		if (i + 1 < segments)
+			ovpn_skb_prefetch_frag(skb_peek(skbs));
 
 		memset(ovpn_skb_cb(skb), 0, sizeof(struct ovpn_cb));
 		ovpn_skb_cb(skb)->batch = batch;
@@ -490,6 +518,12 @@ static void ovpn_send(struct ovpn_priv *ovpn, struct sk_buff *skb,
 	 * independently
 	 */
 	skb_list_walk_safe(skb, curr, next) {
+		/* encrypting this segment can hide the cost of fetching the
+		 * next segment's data into the cache
+		 */
+		if (next)
+			ovpn_skb_prefetchw_linear(next);
+
 		if (unlikely(!ovpn_encrypt_one(peer, curr))) {
 			ovpn_dev_dstats_tx_dropped(ovpn->dev, 1);
 			kfree_skb(curr);
