@@ -72,8 +72,9 @@ error:
 	return ERR_PTR(ret);
 }
 
-static void ovpn_key_ctx_free_crypto(struct ovpn_key_ctx *key)
+static void ovpn_key_ctx_free_state(struct ovpn_key_ctx *key)
 {
+	kfree(key->pktid_recv);
 	if (key->tfm)
 		crypto_free_aead(key->tfm);
 	memzero_explicit(key->implicit_iv, sizeof(key->implicit_iv));
@@ -84,7 +85,7 @@ static void ovpn_key_ctx_free(struct ovpn_key_ctx *key)
 	if (!key)
 		return;
 
-	ovpn_key_ctx_free_crypto(key);
+	ovpn_key_ctx_free_state(key);
 	kfree(key);
 }
 
@@ -96,7 +97,7 @@ static void ovpn_key_ctx_free_work(struct work_struct *work)
 	/* the context may have been replaced independently of its key slot */
 	cond_synchronize_rcu(key->rcu_state);
 	percpu_ref_exit(&key->refcount);
-	ovpn_key_ctx_free_crypto(key);
+	ovpn_key_ctx_free_state(key);
 	kfree(key);
 }
 
@@ -106,6 +107,44 @@ void ovpn_key_ctx_release(struct percpu_ref *ref)
 
 	key = container_of(ref, struct ovpn_key_ctx, refcount);
 	queue_work(ovpn_wq, &key->free_work);
+}
+
+/**
+ * ovpn_key_ctx_replay_state - return replay state for an authenticated packet
+ * @key: receive key context that authenticated the packet
+ *
+ * Replay state is allocated only after a receive key authenticates traffic.
+ * Concurrent completions can reach this function for the same key, so only
+ * the first allocation is installed and the others are discarded.
+ *
+ * Return: replay state on success or NULL if allocation failed
+ */
+struct ovpn_pktid_recv *
+ovpn_key_ctx_replay_state(struct ovpn_key_ctx *key)
+{
+	struct ovpn_pktid_recv *new, *recv;
+
+	/* pairs with the cmpxchg below */
+	recv = READ_ONCE(key->pktid_recv);
+	if (likely(recv))
+		return recv;
+
+	/* this key has no replay state yet so allocate it now */
+	new = kmalloc_obj(*new, GFP_ATOMIC | __GFP_NOWARN);
+	if (unlikely(!new))
+		return NULL;
+
+	ovpn_pktid_recv_init(new);
+	/* another completion may have installed state while this one
+	 * allocated
+	 */
+	recv = cmpxchg(&key->pktid_recv, NULL, new);
+	if (recv)
+		kfree(new);
+	else
+		recv = new;
+
+	return recv;
 }
 
 static struct ovpn_key_ctx *
@@ -120,6 +159,7 @@ ovpn_key_ctx_new(const char *title, const char *alg_name,
 	key = kmalloc_obj(*key);
 	if (!key)
 		return ERR_PTR(-ENOMEM);
+	key->pktid_recv = NULL;
 
 	/* create the concrete AEAD transform first */
 	key->tfm = ovpn_aead_init(title, alg_name, dir->cipher_key,
@@ -138,14 +178,12 @@ ovpn_key_ctx_new(const char *title, const char *alg_name,
 	       dir->nonce_tail_size);
 
 	INIT_WORK(&key->free_work, ovpn_key_ctx_free_work);
-	/* initialize only the packet ID direction this context owns */
 	if (encrypt) {
 		ovpn_pktid_xmit_limit_init(&pktid_limit, false);
-		ovpn_pktid_xmit_init(&key->pid.xmit, &pktid_limit);
+		ovpn_pktid_xmit_init(&key->pktid_xmit, &pktid_limit);
 		atomic64_set(&key->xmit_usage, 0);
 		atomic_set(&key->xmit_rekey_notified, 0);
 	} else {
-		ovpn_pktid_recv_init(&key->pid.recv);
 		atomic64_set(&key->decrypt_failures, 0);
 		atomic_set(&key->decrypt_failure_notified, 0);
 	}

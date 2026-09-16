@@ -264,7 +264,7 @@ int ovpn_aead_encrypt(struct ovpn_peer *peer, struct ovpn_crypto_key_slot *ks,
 	/* obtain packet ID, which is used both as a first
 	 * 4 bytes of nonce and last 4 bytes of associated data.
 	 */
-	ret = ovpn_pktid_xmit_next(&key->pid.xmit, &pktid);
+	ret = ovpn_pktid_xmit_next(&key->pktid_xmit, &pktid);
 	if (unlikely(ret < 0))
 		return ret;
 	notify = ret > 0;
