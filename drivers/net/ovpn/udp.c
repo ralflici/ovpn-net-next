@@ -241,11 +241,8 @@ static void ovpn_udp_recv(struct ovpn_peer *peer, struct sk_buff *skb)
 		/* keep the current reference alive for the next record before
 		 * handing this one to crypto
 		 */
-		if (next && unlikely(!ovpn_peer_hold(peer))) {
-			DEBUG_NET_WARN_ON_ONCE(1);
-			kfree_skb_list(next);
-			next = NULL;
-		}
+		if (next)
+			ovpn_peer_hold(peer);
 
 		ovpn_recv(peer, skb);
 	}

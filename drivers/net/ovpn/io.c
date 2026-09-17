@@ -363,14 +363,10 @@ ovpn_encrypt_refs_get(struct ovpn_peer *peer)
 	if (unlikely(!ks))
 		return NULL;
 
-	/* the caller already owns a peer reference, so failure indicates a
-	 * broken reference lifetime elsewhere
+	/* the caller already owns a peer reference, so it can extend that
+	 * ownership across crypto completion
 	 */
-	if (unlikely(!ovpn_peer_hold(peer))) {
-		DEBUG_NET_WARN_ON_ONCE(1);
-		ovpn_crypto_key_slot_put(ks);
-		return NULL;
-	}
+	ovpn_peer_hold(peer);
 
 	return ks;
 }

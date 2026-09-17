@@ -463,11 +463,11 @@ sock_release:
 	ovpn_socket_release(peer);
 peer_release:
 	/* For UDP, the peer is unreachable until added to the hashtables, so
-	 * dropping the initial reference is enough. For TCP, the peer may be
+	 * killing the initial reference is enough. For TCP, the peer may be
 	 * concurrently reachable via sk_user_data->peer until
-	 * ovpn_socket_release() detaches; rely on the refcount.
+	 * ovpn_socket_release() detaches; rely on the percpu reference.
 	 */
-	ovpn_peer_put(peer);
+	ovpn_peer_kill(peer);
 
 	return ret;
 }

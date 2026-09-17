@@ -22,6 +22,8 @@
 #include "peer.h"
 #include "socket.h"
 
+static void ovpn_peer_release_ref(struct percpu_ref *ref);
+
 static void unlock_ovpn(struct ovpn_priv *ovpn,
 			 struct llist_head *release_list)
 	__releases(&ovpn->lock)
@@ -33,7 +35,7 @@ static void unlock_ovpn(struct ovpn_priv *ovpn,
 	llist_for_each_entry_safe(peer, next, release_list->first,
 				  release_entry) {
 		ovpn_socket_release(peer);
-		ovpn_peer_put(peer);
+		ovpn_peer_kill(peer);
 	}
 }
 
@@ -113,7 +115,6 @@ struct ovpn_peer *ovpn_peer_new(struct ovpn_priv *ovpn, u32 id)
 	RCU_INIT_POINTER(peer->bind, NULL);
 	ovpn_crypto_state_init(&peer->crypto);
 	spin_lock_init(&peer->lock);
-	kref_init(&peer->refcount);
 	ovpn_peer_stats_init(&peer->vpn_stats);
 	ovpn_peer_stats_init(&peer->link_stats);
 	INIT_WORK(&peer->keepalive_work, ovpn_peer_keepalive_send);
@@ -123,6 +124,14 @@ struct ovpn_peer *ovpn_peer_new(struct ovpn_priv *ovpn, u32 id)
 		netdev_err(ovpn->dev,
 			   "cannot initialize dst cache for peer %u\n",
 			   peer->id);
+		kfree(peer);
+		return ERR_PTR(ret);
+	}
+
+	ret = percpu_ref_init(&peer->refcount, ovpn_peer_release_ref, 0,
+			      GFP_KERNEL);
+	if (ret < 0) {
+		dst_cache_destroy(&peer->dst_cache);
 		kfree(peer);
 		return ERR_PTR(ret);
 	}
@@ -348,6 +357,7 @@ static void ovpn_peer_release_rcu(struct rcu_head *head)
 	 * perform it in the RCU callback, when all contexts are done
 	 */
 	dst_cache_destroy(&peer->dst_cache);
+	percpu_ref_exit(&peer->refcount);
 	kfree(peer);
 }
 
@@ -366,12 +376,12 @@ static void ovpn_peer_release(struct ovpn_peer *peer)
 }
 
 /**
- * ovpn_peer_release_kref - callback for kref_put
- * @kref: the kref object belonging to the peer
+ * ovpn_peer_release_ref - callback for the peer percpu reference
+ * @ref: the percpu_ref object belonging to the peer
  */
-void ovpn_peer_release_kref(struct kref *kref)
+static void ovpn_peer_release_ref(struct percpu_ref *ref)
 {
-	struct ovpn_peer *peer = container_of(kref, struct ovpn_peer, refcount);
+	struct ovpn_peer *peer = container_of(ref, struct ovpn_peer, refcount);
 
 	ovpn_peer_release(peer);
 }
@@ -569,7 +579,7 @@ ovpn_peer_get_by_transp_addr_p2p(struct ovpn_priv *ovpn,
 	rcu_read_lock();
 	tmp = rcu_dereference(ovpn->peer);
 	if (likely(tmp && ovpn_peer_transp_match(tmp, ss) &&
-		   ovpn_peer_hold(tmp)))
+		   ovpn_peer_hold_rcu(tmp)))
 		peer = tmp;
 	rcu_read_unlock();
 
@@ -610,7 +620,7 @@ begin:
 		if (!ovpn_peer_transp_match(tmp, &ss))
 			continue;
 
-		if (!ovpn_peer_hold(tmp))
+		if (!ovpn_peer_hold_rcu(tmp))
 			continue;
 
 		peer = tmp;
@@ -641,7 +651,7 @@ static struct ovpn_peer *ovpn_peer_get_by_id_p2p(struct ovpn_priv *ovpn,
 
 	rcu_read_lock();
 	tmp = rcu_dereference(ovpn->peer);
-	if (likely(tmp && tmp->id == peer_id && ovpn_peer_hold(tmp)))
+	if (likely(tmp && tmp->id == peer_id && ovpn_peer_hold_rcu(tmp)))
 		peer = tmp;
 	rcu_read_unlock();
 
@@ -671,7 +681,7 @@ struct ovpn_peer *ovpn_peer_get_by_id(struct ovpn_priv *ovpn, u32 peer_id)
 		if (tmp->id != peer_id)
 			continue;
 
-		if (!ovpn_peer_hold(tmp))
+		if (!ovpn_peer_hold_rcu(tmp))
 			continue;
 
 		peer = tmp;
@@ -745,7 +755,7 @@ struct ovpn_peer *ovpn_peer_get_by_dst(struct ovpn_priv *ovpn,
 	if (ovpn->mode == OVPN_MODE_P2P) {
 		rcu_read_lock();
 		peer = rcu_dereference(ovpn->peer);
-		if (unlikely(peer && !ovpn_peer_hold(peer)))
+		if (unlikely(peer && !ovpn_peer_hold_rcu(peer)))
 			peer = NULL;
 		rcu_read_unlock();
 		return peer;
@@ -763,7 +773,7 @@ struct ovpn_peer *ovpn_peer_get_by_dst(struct ovpn_priv *ovpn,
 		break;
 	}
 
-	if (unlikely(peer && !ovpn_peer_hold(peer)))
+	if (unlikely(peer && !ovpn_peer_hold_rcu(peer)))
 		peer = NULL;
 	rcu_read_unlock();
 
@@ -1369,8 +1379,7 @@ static time64_t ovpn_peer_keepalive_work_single(struct ovpn_peer *peer,
 		netdev_dbg(peer->ovpn->dev,
 			   "sending keepalive to peer %u\n",
 			   peer->id);
-		if (WARN_ON(!ovpn_peer_hold(peer)))
-			return 0;
+		ovpn_peer_hold(peer);
 		if (!queue_work(ovpn_wq, &peer->keepalive_work))
 			ovpn_peer_put(peer);
 	}
