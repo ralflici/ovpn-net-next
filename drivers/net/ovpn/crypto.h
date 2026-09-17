@@ -10,6 +10,8 @@
 #ifndef _NET_OVPN_OVPNCRYPTO_H_
 #define _NET_OVPN_OVPNCRYPTO_H_
 
+#include <linux/percpu-refcount.h>
+#include <linux/rcupdate.h>
 #include <linux/workqueue.h>
 
 #include "pktid.h"
@@ -47,8 +49,9 @@ struct ovpn_crypto_key_slot {
 
 	struct ovpn_pktid_recv pid_recv ____cacheline_aligned_in_smp;
 	struct ovpn_pktid_xmit pid_xmit ____cacheline_aligned_in_smp;
-	struct rcu_work free_work;
-	struct kref refcount;
+	struct work_struct free_work;
+	unsigned long rcu_state;
+	struct percpu_ref refcount;
 };
 
 struct ovpn_crypto_state {
@@ -61,7 +64,7 @@ struct ovpn_crypto_state {
 
 static inline bool ovpn_crypto_key_slot_hold(struct ovpn_crypto_key_slot *ks)
 {
-	return kref_get_unless_zero(&ks->refcount);
+	return percpu_ref_tryget_live_rcu(&ks->refcount);
 }
 
 static inline void ovpn_crypto_state_init(struct ovpn_crypto_state *cs)
@@ -121,11 +124,25 @@ ovpn_crypto_key_slot_primary(const struct ovpn_crypto_state *cs)
 	return ks;
 }
 
-void ovpn_crypto_key_slot_release(struct kref *kref);
+void ovpn_crypto_key_slot_release(struct percpu_ref *ref);
 
 static inline void ovpn_crypto_key_slot_put(struct ovpn_crypto_key_slot *ks)
 {
-	kref_put(&ks->refcount, ovpn_crypto_key_slot_release);
+	percpu_ref_put(&ks->refcount);
+}
+
+/**
+ * ovpn_crypto_key_slot_kill - stop new users and drop the initial reference
+ * @ks: key slot which has already been unpublished
+ *
+ * percpu_ref does not guarantee an RCU grace period before release. Record
+ * the RCU state after unpublishing the key so the final worker can synchronize
+ * with lockless readers without unconditionally starting another grace period.
+ */
+static inline void ovpn_crypto_key_slot_kill(struct ovpn_crypto_key_slot *ks)
+{
+	ks->rcu_state = get_state_synchronize_rcu();
+	percpu_ref_kill(&ks->refcount);
 }
 
 int ovpn_crypto_state_reset(struct ovpn_crypto_state *cs,
