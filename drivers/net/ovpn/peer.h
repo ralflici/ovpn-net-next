@@ -10,6 +10,7 @@
 #ifndef _NET_OVPN_OVPNPEER_H_
 #define _NET_OVPN_OVPNPEER_H_
 
+#include <linux/cache.h>
 #include <linux/percpu-refcount.h>
 #include <net/dst_cache.h>
 #include <net/strparser.h>
@@ -53,14 +54,14 @@
  * @keepalive_timeout: seconds after which an inactive peer is considered dead
  * @keepalive_recv_exp: future timestamp when the peer should expire
  * @last_recv: timestamp of the last authenticated received packet
- * @vpn_stats: per-peer in-VPN TX/RX stats
- * @link_stats: per-peer link/transport TX/RX stats
  * @delete_reason: why peer was deleted (i.e. timeout, transport error, ..)
  * @lock: protects binding to peer (bind) and keepalive* fields
  * @refcount: reference counter
  * @rcu: used to free peer in an RCU safe way
  * @release_entry: entry for the socket release list
  * @keepalive_work: used to schedule keepalive sending
+ * @vpn_stats: per-CPU in-VPN TX/RX stats
+ * @link_stats: per-CPU link/transport TX/RX stats
  */
 struct ovpn_peer {
 	struct ovpn_priv *ovpn;
@@ -107,14 +108,17 @@ struct ovpn_peer {
 	unsigned long keepalive_timeout;
 	unsigned long keepalive_recv_exp;
 	time64_t last_recv;
-	struct ovpn_peer_stats vpn_stats;
-	struct ovpn_peer_stats link_stats;
 	enum ovpn_del_peer_reason delete_reason;
 	spinlock_t lock; /* protects bind  and keepalive* */
 	struct percpu_ref refcount;
 	struct rcu_head rcu;
 	struct llist_node release_entry;
 	struct work_struct keepalive_work;
+
+	__cacheline_group_begin_aligned(stats_ro);
+	struct pcpu_sw_netstats __percpu *vpn_stats;
+	struct pcpu_sw_netstats __percpu *link_stats;
+	__cacheline_group_end_aligned(stats_ro);
 };
 
 /**

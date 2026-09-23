@@ -115,30 +115,42 @@ struct ovpn_peer *ovpn_peer_new(struct ovpn_priv *ovpn, u32 id)
 	RCU_INIT_POINTER(peer->bind, NULL);
 	ovpn_crypto_state_init(&peer->crypto);
 	spin_lock_init(&peer->lock);
-	ovpn_peer_stats_init(&peer->vpn_stats);
-	ovpn_peer_stats_init(&peer->link_stats);
 	INIT_WORK(&peer->keepalive_work, ovpn_peer_keepalive_send);
+
+	ret = -ENOMEM;
+	peer->vpn_stats = netdev_alloc_pcpu_stats(struct pcpu_sw_netstats);
+	if (!peer->vpn_stats)
+		goto err_free_peer;
+
+	peer->link_stats = netdev_alloc_pcpu_stats(struct pcpu_sw_netstats);
+	if (!peer->link_stats)
+		goto err_free_stats;
 
 	ret = dst_cache_init(&peer->dst_cache, GFP_KERNEL);
 	if (ret < 0) {
 		netdev_err(ovpn->dev,
 			   "cannot initialize dst cache for peer %u\n",
 			   peer->id);
-		kfree(peer);
-		return ERR_PTR(ret);
+		goto err_free_stats;
 	}
 
 	ret = percpu_ref_init(&peer->refcount, ovpn_peer_release_ref, 0,
 			      GFP_KERNEL);
-	if (ret < 0) {
-		dst_cache_destroy(&peer->dst_cache);
-		kfree(peer);
-		return ERR_PTR(ret);
-	}
+	if (ret < 0)
+		goto err_destroy_dst_cache;
 
 	netdev_hold(ovpn->dev, &peer->dev_tracker, GFP_KERNEL);
 
 	return peer;
+
+err_destroy_dst_cache:
+	dst_cache_destroy(&peer->dst_cache);
+err_free_stats:
+	free_percpu(peer->link_stats);
+	free_percpu(peer->vpn_stats);
+err_free_peer:
+	kfree(peer);
+	return ERR_PTR(ret);
 }
 
 /**
@@ -358,6 +370,8 @@ static void ovpn_peer_release_rcu(struct rcu_head *head)
 	 */
 	dst_cache_destroy(&peer->dst_cache);
 	percpu_ref_exit(&peer->refcount);
+	free_percpu(peer->link_stats);
+	free_percpu(peer->vpn_stats);
 	kfree(peer);
 }
 

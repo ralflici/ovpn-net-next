@@ -13,43 +13,37 @@
 
 #include <linux/netdevice.h>
 
-/* one stat */
-struct ovpn_peer_stat {
-	atomic64_t bytes;
-	atomic64_t packets;
-};
-
-/* rx and tx stats combined */
-struct ovpn_peer_stats {
-	struct ovpn_peer_stat rx;
-	struct ovpn_peer_stat tx;
-};
-
-void ovpn_peer_stats_init(struct ovpn_peer_stats *ps);
-
-static inline void ovpn_peer_stats_increment(struct ovpn_peer_stat *stat,
-					     const unsigned int n)
+static inline void
+ovpn_peer_stats_increment_rx(struct pcpu_sw_netstats __percpu *stats,
+			     const unsigned int n)
 {
-	atomic64_add(n, &stat->bytes);
-	atomic64_inc(&stat->packets);
+	struct pcpu_sw_netstats *s;
+
+	lockdep_assert_in_softirq();
+	s = this_cpu_ptr(stats);
+	u64_stats_update_begin(&s->syncp);
+	u64_stats_add(&s->rx_bytes, n);
+	u64_stats_inc(&s->rx_packets);
+	u64_stats_update_end(&s->syncp);
 }
 
-static inline void ovpn_peer_stats_increment_rx(struct ovpn_peer_stats *stats,
-						const unsigned int n)
+static inline void
+ovpn_peer_stats_add_tx(struct pcpu_sw_netstats __percpu *stats,
+		       const unsigned int bytes, unsigned int packets)
 {
-	ovpn_peer_stats_increment(&stats->rx, n);
+	struct pcpu_sw_netstats *s;
+
+	lockdep_assert_in_softirq();
+	s = this_cpu_ptr(stats);
+	u64_stats_update_begin(&s->syncp);
+	u64_stats_add(&s->tx_bytes, bytes);
+	u64_stats_add(&s->tx_packets, packets);
+	u64_stats_update_end(&s->syncp);
 }
 
-static inline void ovpn_peer_stats_add_tx(struct ovpn_peer_stats *stats,
-					  const unsigned int bytes,
-					  unsigned int packets)
-{
-	atomic64_add(bytes, &stats->tx.bytes);
-	atomic64_add(packets, &stats->tx.packets);
-}
-
-static inline void ovpn_peer_stats_increment_tx(struct ovpn_peer_stats *stats,
-						const unsigned int n)
+static inline void
+ovpn_peer_stats_increment_tx(struct pcpu_sw_netstats __percpu *stats,
+			     const unsigned int n)
 {
 	ovpn_peer_stats_add_tx(stats, n, 1);
 }
