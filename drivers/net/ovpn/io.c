@@ -243,6 +243,16 @@ void ovpn_recv(struct ovpn_peer *peer, struct sk_buff *skb)
 	ovpn_decrypt_post(skb, ovpn_aead_decrypt(peer, ks, skb));
 }
 
+static void ovpn_encrypt_key_exhausted(struct ovpn_peer *peer,
+				       struct ovpn_crypto_key_slot *ks)
+{
+	netdev_warn(peer->ovpn->dev, "killing key %u for peer %u\n",
+		    ks->key_id, peer->id);
+	if (ovpn_crypto_kill_key(&peer->crypto, ks->key_id))
+		/* let userspace know so that a new key must be negotiated */
+		ovpn_nl_key_swap_notify(peer, ks->key_id);
+}
+
 void ovpn_encrypt_post(void *data, int ret)
 {
 	unsigned int orig_len, packets = 1;
@@ -273,12 +283,7 @@ void ovpn_encrypt_post(void *data, int ret)
 		/* we ran out of IVs and we must kill the key as it can't be
 		 * used anymore
 		 */
-		netdev_warn(peer->ovpn->dev,
-			    "killing key %u for peer %u\n", ks->key_id,
-			    peer->id);
-		if (ovpn_crypto_kill_key(&peer->crypto, ks->key_id))
-			/* let userspace know so that a new key must be negotiated */
-			ovpn_nl_key_swap_notify(peer, ks->key_id);
+		ovpn_encrypt_key_exhausted(peer, ks);
 	}
 
 	if (batch) {
@@ -392,6 +397,7 @@ static bool ovpn_encrypt_gso_queue(struct sk_buff_head *skbs,
 	unsigned int offset = 0, i, len;
 	struct ovpn_crypto_key_slot *ks;
 	struct sk_buff *skb;
+	u32 first_pktid;
 
 	/* acquire all shared state before removing the first input skb so that
 	 * failure can leave the queue intact for the ordinary transmit path
@@ -399,6 +405,17 @@ static bool ovpn_encrypt_gso_queue(struct sk_buff_head *skbs,
 	ks = ovpn_encrypt_refs_get(peer);
 	if (unlikely(!ks))
 		return false;
+
+	/* reserve the complete range before dequeuing any input skb so that a
+	 * failure leaves the ordinary transmit path available as a fallback
+	 */
+	if (unlikely(ovpn_pktid_xmit_range(&ks->pid_xmit, segments,
+					   &first_pktid))) {
+		ovpn_encrypt_key_exhausted(peer, ks);
+		ovpn_crypto_key_slot_put(ks);
+		ovpn_peer_put(peer);
+		return false;
+	}
 
 	/* the aggregate owns these references until every sync or async crypto
 	 * completion has finished
@@ -416,7 +433,8 @@ static bool ovpn_encrypt_gso_queue(struct sk_buff_head *skbs,
 		memset(ovpn_skb_cb(skb), 0, sizeof(struct ovpn_cb));
 		ovpn_skb_cb(skb)->batch = batch;
 		ovpn_encrypt_post(skb, ovpn_aead_encrypt_gso(peer, ks, skb,
-							     batch, offset));
+							     batch, offset,
+							     first_pktid + i));
 		offset += len;
 	}
 
