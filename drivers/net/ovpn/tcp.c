@@ -143,8 +143,9 @@ static void ovpn_tcp_rcv(struct strparser *strp, struct sk_buff *skb)
 	 * this peer
 	 */
 	ovpn_peer_hold(peer);
-
+	local_bh_disable();
 	ovpn_recv(peer, skb);
+	local_bh_enable();
 	return;
 err:
 	/* take reference for deferred peer deletion */

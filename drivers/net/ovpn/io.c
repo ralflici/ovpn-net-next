@@ -443,9 +443,7 @@ void ovpn_recv(struct ovpn_peer *peer, struct sk_buff *skb)
 	struct ovpn_crypto_key_slot *ks;
 	u8 key_id;
 
-	local_bh_disable();
 	ovpn_peer_stats_increment_rx(peer->link_stats, skb->len);
-	local_bh_enable();
 
 	/* get the key slot matching the key ID in the received packet */
 	key_id = ovpn_key_id_from_skb(skb);
