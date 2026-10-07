@@ -18,6 +18,11 @@
 int ovpn_advance_encrypt_key(struct ovpn_crypto_key_slot *ks, u16 target_epoch);
 void ovpn_request_encrypt_epoch(struct ovpn_crypto_key_slot *ks,
 				unsigned int target_epoch);
+int ovpn_aead_encrypt_reserve(struct ovpn_peer *peer,
+			      struct ovpn_crypto_key_slot *ks,
+			      struct ovpn_key_ctx *encrypt,
+			      unsigned int packets, unsigned int plaintext_len,
+			      u64 *first_seq);
 
 int ovpn_aead_encrypt(struct ovpn_peer *peer, struct ovpn_crypto_key_slot *ks,
 		      struct sk_buff *skb);

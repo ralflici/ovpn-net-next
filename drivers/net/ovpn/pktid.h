@@ -77,55 +77,23 @@ static inline void ovpn_pktid_xmit_limit_init(struct ovpn_limit *limit,
 }
 
 /**
- * ovpn_pktid_xmit_next - allocate a transmit packet ID
+ * ovpn_pktid_xmit_reserve - reserve consecutive transmit packet IDs
  * @pid: transmit packet ID state
- * @pktid: location where the generated packet ID is stored
+ * @count: non-zero number of IDs to reserve
+ * @pktid: location where the first reserved packet ID is stored
  *
- * The returned packet ID becomes part of the AEAD nonce. Reusing it would
- * reuse an IV, so the helper rejects the packet before the configured packet-ID
- * space wraps.
+ * The returned packet IDs become part of AEAD nonces. Reusing them would reuse
+ * IVs, so the reservation is all-or-nothing and exhausts the state if the
+ * complete range does not fit in the configured packet-ID space.
  *
  * The hard limit stops TX. Crossing the soft limit returns 1 so the caller can
- * arrange a fresh key before that happens.
+ * arrange fresh key material before that happens.
  *
- * Return: 1 if userspace should be notified, 0 if no notification is needed,
- * or a negative error code otherwise.
+ * Return: 1 when the reservation crosses the soft limit, 0 otherwise, or
+ * -ERANGE when the complete range cannot be reserved
  */
-static inline int ovpn_pktid_xmit_next(struct ovpn_pktid_xmit *pid, u64 *pktid)
-{
-	s64 seq_num = atomic64_read(&pid->seq_num);
-
-	for (;;) {
-		/* packet IDs create cipher IVs and must not wrap */
-		if (unlikely(!seq_num || (u64)seq_num > pid->limit.hard))
-			return -ERANGE;
-
-		/* ID allocation only requires atomicity, not ordering */
-		if (atomic64_try_cmpxchg_relaxed(&pid->seq_num, &seq_num,
-						 seq_num + 1))
-			break;
-	}
-
-	*pktid = seq_num;
-
-	return (u64)seq_num >= pid->limit.soft;
-}
-
-/**
- * ovpn_pktid_xmit_range - reserve consecutive packet IDs
- * @pid: transmit packet-ID state
- * @count: non-zero number of IDs to reserve
- * @pktid: first reserved packet ID
- *
- * The reservation is all-or-nothing. If the requested range would cross the
- * configured packet-ID space, exhaust the state without returning the unused
- * tail. Packet IDs can be skipped but never reused as an AEAD IV.
- *
- * Return: 1 if the range crosses the soft packet-ID threshold, 0 if it does
- * not, or -ERANGE when no complete range remains
- */
-static inline int ovpn_pktid_xmit_range(struct ovpn_pktid_xmit *pid,
-					unsigned int count, u64 *pktid)
+static inline int ovpn_pktid_xmit_reserve(struct ovpn_pktid_xmit *pid,
+					  unsigned int count, u64 *pktid)
 {
 	s64 old = atomic64_read(&pid->seq_num);
 	u64 first, next;
@@ -135,20 +103,18 @@ static inline int ovpn_pktid_xmit_range(struct ovpn_pktid_xmit *pid,
 		first = (u64)old;
 		next = first + count;
 
-		/* space is already exhausted */
+		/* packet IDs create cipher IVs and must not wrap */
 		if (unlikely(!old || first > pid->limit.hard))
 			return -ERANGE;
 
 		fits = count - 1 <= pid->limit.hard - first;
-		/* if it doesn't fit we still have to publish exhaustion (0)
-		 * so concurrent allocators stop using this key
+		/* publish exhaustion if the complete range does not fit so
+		 * concurrent allocators stop using this key
 		 */
 		if (unlikely(!fits))
 			next = 0;
 
-		/* if another CPU changed the state, we retry using the new
-		 * seq_num value
-		 */
+		/* ID allocation only requires atomicity, not ordering */
 		if (!atomic64_try_cmpxchg_relaxed(&pid->seq_num, &old,
 						  (s64)next))
 			continue;

@@ -272,10 +272,23 @@ void ovpn_request_encrypt_epoch(struct ovpn_crypto_key_slot *ks,
 		;
 }
 
-static int ovpn_aead_encrypt_next_seq(struct ovpn_peer *peer,
-				      struct ovpn_crypto_key_slot *ks,
-				      struct ovpn_key_ctx *encrypt,
-				      unsigned int pkt_len, u64 *seq)
+/**
+ * ovpn_aead_encrypt_reserve - reserve packet IDs and cipher usage
+ * @peer: peer that owns the key slot
+ * @ks: key slot used for encryption
+ * @encrypt: concrete transmit key context
+ * @packets: number of equal-sized packets in the reservation
+ * @plaintext_len: plaintext length charged for each packet
+ * @first_seq: location where the first reserved packet ID is stored
+ *
+ * Return: 0 on success, -EAGAIN after promoting an epoch key so the caller can
+ * retry with the new context, or another negative error code on failure
+ */
+int ovpn_aead_encrypt_reserve(struct ovpn_peer *peer,
+			      struct ovpn_crypto_key_slot *ks,
+			      struct ovpn_key_ctx *encrypt,
+			      unsigned int packets, unsigned int plaintext_len,
+			      u64 *first_seq)
 {
 	unsigned int target_epoch;
 	bool must_rotate = false;
@@ -283,18 +296,19 @@ static int ovpn_aead_encrypt_next_seq(struct ovpn_peer *peer,
 	u64 aead_blocks;
 	int ret;
 
-	/* hard packet-ID exhaustion requires fresh key material */
-	ret = ovpn_pktid_xmit_next(&encrypt->pktid_xmit, seq);
+	/* reserve every nonce before charging the cipher usage budget */
+	ret = ovpn_pktid_xmit_reserve(&encrypt->pktid_xmit, packets, first_seq);
 	if (unlikely(ret < 0)) {
 		if (!ks->epoch_format)
 			return ret;
 		must_rotate = true;
 	} else {
 		notify = ret > 0;
-		aead_blocks = ovpn_aead_limit_blocks(ks->cipher_alg,
-						    ks->aad_size, pkt_len);
-		ret = ovpn_key_usage_xmit(&encrypt->xmit_usage,
-					  &ks->xmit_limit, 1, aead_blocks);
+		aead_blocks = packets * ovpn_aead_limit_blocks(ks->cipher_alg,
+							       ks->aad_size,
+							       plaintext_len);
+		ret = ovpn_key_usage_xmit(&encrypt->xmit_usage, &ks->xmit_limit,
+					  packets, aead_blocks);
 		if (unlikely(ret < 0)) {
 			/* epoch keys rotate at the hard limit */
 			if (!ks->epoch_format)
@@ -378,7 +392,7 @@ retry:
 
 	tag_size = crypto_aead_authsize(key->tfm);
 
-	ret = ovpn_aead_encrypt_next_seq(peer, ks, key, plaintext_len, &seq);
+	ret = ovpn_aead_encrypt_reserve(peer, ks, key, 1, plaintext_len, &seq);
 	if (unlikely(ret == -EAGAIN)) {
 		/* retry with the promoted epoch key */
 		ovpn_skb_cb(skb)->key = NULL;

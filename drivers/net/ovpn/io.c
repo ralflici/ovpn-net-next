@@ -631,105 +631,9 @@ static void ovpn_skb_prefetch_frag(const struct sk_buff *skb)
 		prefetch((void *)addr);
 }
 
-static bool ovpn_encrypt_gso_queue(struct sk_buff_head *skbs,
-				   struct ovpn_peer *peer,
-				   struct sk_buff *batch,
-				   unsigned int segments)
-{
-	unsigned int offset = 0, i, len;
-	struct ovpn_crypto_key_slot *ks;
-	u64 aead_blocks, first_blocks;
-	struct ovpn_key_ctx *key;
-	struct sk_buff *skb;
-	bool notify = false;
-	u64 first_pktid;
-	int ret;
-
-	/* acquire all shared state before removing the first input skb so that
-	 * failure can leave the queue intact for the ordinary transmit path
-	 */
-	ks = ovpn_encrypt_refs_get(peer);
-	if (unlikely(!ks))
-		return false;
-	ret = ovpn_key_ctx_get(&key, &ks->encrypt);
-	if (unlikely(ret)) {
-		ovpn_crypto_key_slot_put(ks);
-		ovpn_peer_put(peer);
-		return false;
-	}
-
-	/* all selected skbs have the same length unless this group includes
-	 * the shorter final segment, so account the batch without walking it
-	 */
-	first_blocks = ovpn_aead_limit_blocks(ks->cipher_alg, ks->aad_size,
-					      skb_peek(skbs)->len);
-	aead_blocks = segments * first_blocks;
-	if (segments == skb_queue_len(skbs)) {
-		aead_blocks -= first_blocks;
-		aead_blocks += ovpn_aead_limit_blocks(ks->cipher_alg,
-						      ks->aad_size,
-						      skb_peek_tail(skbs)->len);
-	}
-
-	/* reserve the complete range before dequeuing any input skb so that a
-	 * failure leaves the ordinary transmit path available as a fallback
-	 */
-	ret = ovpn_pktid_xmit_range(&key->pktid_xmit, segments, &first_pktid);
-	if (unlikely(ret < 0)) {
-		ovpn_encrypt_key_exhausted(peer, ks);
-		ovpn_key_ctx_put(key);
-		ovpn_crypto_key_slot_put(ks);
-		ovpn_peer_put(peer);
-		return false;
-	}
-	notify = ret > 0;
-	ret = ovpn_key_usage_xmit(&key->xmit_usage, &ks->xmit_limit,
-				  segments, aead_blocks);
-	if (unlikely(ret < 0)) {
-		ovpn_encrypt_key_exhausted(peer, ks);
-		ovpn_key_ctx_put(key);
-		ovpn_crypto_key_slot_put(ks);
-		ovpn_peer_put(peer);
-		return false;
-	}
-	notify |= ret > 0;
-	if (unlikely(notify) && !atomic_xchg(&key->xmit_rekey_notified, 1))
-		ovpn_nl_key_swap_notify(peer, ks->key_id);
-
-	/* the aggregate owns these references until every sync or async crypto
-	 * completion has finished
-	 */
-	memset(ovpn_skb_cb(batch), 0, sizeof(struct ovpn_cb));
-	ovpn_skb_cb(batch)->peer = peer;
-	ovpn_skb_cb(batch)->ks = ks;
-	ovpn_skb_cb(batch)->key = key;
-	atomic_set(&ovpn_skb_cb(batch)->batch_state.pending, segments);
-	atomic_set(&ovpn_skb_cb(batch)->batch_state.failed, 0);
-
-	for (i = 0; i < segments; i++) {
-		skb = __skb_dequeue(skbs);
-		len = skb->len + OVPN_AEAD_DIRECT_OVERHEAD;
-
-		/* overlap fetching the next segment's shared payload with
-		 * encryption of the current segment
-		 */
-		if (i + 1 < segments)
-			ovpn_skb_prefetch_frag(skb_peek(skbs));
-
-		memset(ovpn_skb_cb(skb), 0, sizeof(struct ovpn_cb));
-		ovpn_skb_cb(skb)->batch = batch;
-		ovpn_encrypt_post(skb, ovpn_aead_encrypt_gso(peer, ks, key,
-							     skb, batch,
-							     offset,
-							     first_pktid + i));
-		offset += len;
-	}
-
-	return true;
-}
-
 static struct sk_buff *ovpn_udp_gso_alloc(const struct sk_buff *first_segment,
 					  unsigned int batch_len,
+					  unsigned int gso_size,
 					  unsigned int segments)
 {
 	struct sk_buff *gso_skb;
@@ -761,11 +665,110 @@ static struct sk_buff *ovpn_udp_gso_alloc(const struct sk_buff *first_segment,
 #endif
 
 	skb_shinfo(gso_skb)->gso_type = SKB_GSO_UDP_L4;
-	skb_shinfo(gso_skb)->gso_size = first_segment->len +
-					OVPN_AEAD_DIRECT_OVERHEAD;
+	skb_shinfo(gso_skb)->gso_size = gso_size;
 	skb_shinfo(gso_skb)->gso_segs = segments;
 
 	return gso_skb;
+}
+
+static bool ovpn_encrypt_gso_queue(struct sk_buff_head *skbs,
+				   struct ovpn_peer *peer)
+{
+	unsigned int segments, seg_len, i, len, offset = 0;
+	unsigned int batch_len, max_segs, record_overhead;
+	struct ovpn_crypto_key_slot *ks;
+	struct ovpn_key_ctx *key = NULL;
+	struct sk_buff *batch, *skb;
+	u64 first_pktid;
+	int ret;
+
+	/* acquire the slot before calculating its wire-format overhead */
+	ks = ovpn_encrypt_refs_get(peer);
+	if (unlikely(!ks))
+		return false;
+
+	record_overhead = ks->aad_size + OVPN_AEAD_TAG_SIZE;
+	seg_len = skb_peek(skbs)->len + record_overhead;
+	max_segs = min_t(unsigned int, UDP_MAX_SEGMENTS,
+			 OVPN_UDP_GSO_MAX_PAYLOAD / seg_len);
+	if (unlikely(max_segs < 2))
+		goto err_refs;
+
+	segments = min_t(unsigned int, skb_queue_len(skbs), max_segs);
+	/* only the final input skb may be shorter than the nominal GSO size */
+	batch_len = segments * seg_len;
+	if (segments == skb_queue_len(skbs))
+		batch_len -= skb_peek(skbs)->len - skb_peek_tail(skbs)->len;
+
+	/* allocate before consuming packet IDs so allocation failure can fall
+	 * back to ordinary per-segment encryption without leaving a gap
+	 */
+	batch = ovpn_udp_gso_alloc(skb_peek(skbs), batch_len, seg_len,
+				   segments);
+	if (unlikely(!batch))
+		goto err_refs;
+
+retry:
+	ret = ovpn_key_ctx_get(&key, &ks->encrypt);
+	if (unlikely(ret))
+		goto err_batch;
+
+	/* charge every record as a full-sized segment; the possible shorter
+	 * tail is conservatively overcounted without another list inspection
+	 */
+	ret = ovpn_aead_encrypt_reserve(peer, ks, key, segments,
+					skb_peek(skbs)->len, &first_pktid);
+	if (unlikely(ret == -EAGAIN)) {
+		/* keys have rotated so try reserving again with the new key */
+		ovpn_key_ctx_put(key);
+		key = NULL;
+		goto retry;
+	}
+	if (unlikely(ret < 0)) {
+		if (ret == -ERANGE)
+			ovpn_encrypt_key_exhausted(peer, ks);
+		goto err_key;
+	}
+
+	/* the aggregate owns these references until every sync or async crypto
+	 * completion has finished
+	 */
+	memset(ovpn_skb_cb(batch), 0, sizeof(struct ovpn_cb));
+	ovpn_skb_cb(batch)->peer = peer;
+	ovpn_skb_cb(batch)->ks = ks;
+	ovpn_skb_cb(batch)->key = key;
+	atomic_set(&ovpn_skb_cb(batch)->batch_state.pending, segments);
+	atomic_set(&ovpn_skb_cb(batch)->batch_state.failed, 0);
+
+	for (i = 0; i < segments; i++) {
+		skb = __skb_dequeue(skbs);
+		len = skb->len + record_overhead;
+
+		/* overlap fetching the next segment's shared payload with
+		 * encryption of the current segment
+		 */
+		if (i + 1 < segments)
+			ovpn_skb_prefetch_frag(skb_peek(skbs));
+
+		memset(ovpn_skb_cb(skb), 0, sizeof(struct ovpn_cb));
+		ovpn_skb_cb(skb)->batch = batch;
+		ovpn_encrypt_post(skb, ovpn_aead_encrypt_gso(peer, ks, key,
+							     skb, batch,
+							     offset,
+							     first_pktid + i));
+		offset += len;
+	}
+
+	return true;
+
+err_key:
+	ovpn_key_ctx_put(key);
+err_batch:
+	kfree_skb(batch);
+err_refs:
+	ovpn_crypto_key_slot_put(ks);
+	ovpn_peer_put(peer);
+	return false;
 }
 
 /* send skb to connected peer, if any */
@@ -796,46 +799,14 @@ static void ovpn_send(struct ovpn_priv *ovpn, struct sk_buff *skb,
 /* encrypt fixed-size input segments into one or more UDP GSO aggregates */
 static void ovpn_send_gso(struct sk_buff_head *skbs, struct ovpn_peer *peer)
 {
-	unsigned int max_segs = 1, seg_len, batch_len, segs;
-	struct sk_buff *batch;
-
-	seg_len = skb_peek(skbs)->len + OVPN_AEAD_DIRECT_OVERHEAD;
-	max_segs = min_t(unsigned int, UDP_MAX_SEGMENTS,
-			 OVPN_UDP_GSO_MAX_PAYLOAD / seg_len);
-
-	/* if even two encrypted skbs cannot fit, leave the whole queue for the
-	 * ordinary transmit path
-	 */
-	if (max_segs < 2)
-		return;
-
-	/* An input GSO skb might be prduce more than max_segs segments so we
-	 * consume as many as we can for each iteration. A final single skb, or
-	 * the whole remainder after an allocation failure, stays queued and
-	 * fallback to the ordinary transmit path.
+	/* An input GSO skb might produce more records than one UDP GSO skb can
+	 * hold, so consume one aggregate at a time. A final single skb, or the
+	 * whole remainder after a failure, stays queued and falls back to the
+	 * ordinary transmit path.
 	 */
 	while (skb_queue_len(skbs) > 1) {
-		segs = min_t(unsigned int, skb_queue_len(skbs), max_segs);
-
-		/* all but the final input skb have the same length, so start
-		 * with the full-size calculation and adjust only the final
-		 * group below
-		 */
-		batch_len = segs * (skb_peek(skbs)->len +
-				    OVPN_AEAD_DIRECT_OVERHEAD);
-		if (segs == skb_queue_len(skbs))
-			batch_len -= skb_peek(skbs)->len -
-				     skb_peek_tail(skbs)->len;
-
-		batch = ovpn_udp_gso_alloc(skb_peek(skbs), batch_len, segs);
-		if (unlikely(!batch))
-			return;
-
-		if (unlikely(!ovpn_encrypt_gso_queue(skbs, peer,
-						     batch, segs))) {
-			kfree_skb(batch);
-			return;
-		}
+		if (!ovpn_encrypt_gso_queue(skbs, peer))
+			break;
 	}
 }
 
