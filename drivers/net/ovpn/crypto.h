@@ -60,45 +60,54 @@ struct ovpn_peer_key_reset {
 
 /* state for one concrete AEAD key direction */
 struct ovpn_key_ctx {
-	u16 epoch;
 	struct crypto_aead *tfm;
 	u8 implicit_iv[OVPN_NONCE_SIZE];
-	struct ovpn_pktid_xmit pktid_xmit ____cacheline_aligned_in_smp;
-	/* allocated after an RX key first authenticates a packet */
-	struct ovpn_pktid_recv *pktid_recv;
-	atomic64_t xmit_usage;
-	/* whether userspace was notified that TX should rekey */
-	atomic_t xmit_rekey_notified;
-	atomic64_t decrypt_failures;
-	/* whether userspace was notified of excessive decrypt failures */
-	atomic_t decrypt_failure_notified;
-	struct work_struct free_work;
+	u16 epoch;
 	/* RCU state recorded when this context is unpublished */
 	unsigned long rcu_state;
 	struct percpu_ref refcount;
+
+	/* allocated after an RX key first authenticates a packet */
+	struct ovpn_pktid_recv *pktid_recv;
+	struct ovpn_pktid_xmit pktid_xmit ____cacheline_aligned_in_smp;
+
+	atomic64_t xmit_usage;
+	/* whether userspace was notified that TX should rekey */
+	atomic_t xmit_rekey_notified;
+	/* whether userspace was notified of excessive decrypt failures */
+	atomic_t decrypt_failure_notified;
+	atomic64_t decrypt_failures;
+
+	struct work_struct free_work;
 };
 
 struct ovpn_crypto_key_slot {
+	__cacheline_group_begin_aligned(fast_path);
 	u8 key_id;
-	enum ovpn_cipher_alg cipher_alg;
-	struct ovpn_limit xmit_limit;
-	const char *alg_name;
 	bool epoch_format;
-	unsigned int aad_size;
-	unsigned int payload_offset;
-	unsigned int tail_tag_size;
+	u16 aad_size;
+	u16 payload_offset;
+	u16 tail_tag_size;
+	enum ovpn_cipher_alg cipher_alg;
 	/* highest epoch requested by either the TX or RX path */
 	atomic_t tx_epoch_request;
 
-	struct ovpn_epoch_key epoch_key_send;
-	struct ovpn_epoch_key epoch_key_recv;
-
+	struct percpu_ref refcount;
 	struct ovpn_key_ctx __rcu *encrypt;
 	struct ovpn_key_ctx __rcu *decrypt;
+	struct ovpn_limit xmit_limit;
+	__cacheline_group_end_aligned(fast_path);
+
+	const char *alg_name;
+	unsigned long rcu_state;
+
 	struct ovpn_key_ctx __rcu *retiring_key;
 
-	struct ovpn_future_keys future_tx_keys;
 	struct ovpn_future_keys future_rx_keys;
+	struct ovpn_epoch_key epoch_key_recv;
+
+	struct ovpn_future_keys future_tx_keys;
+	struct ovpn_epoch_key epoch_key_send;
 
 	struct work_struct tx_refill;
 	struct work_struct rx_refill;
@@ -111,9 +120,10 @@ struct ovpn_crypto_key_slot {
 	seqcount_spinlock_t rx_seqcount;
 
 	struct work_struct free_work;
-	unsigned long rcu_state;
-	struct percpu_ref refcount;
 };
+
+static_assert(offsetofend(struct ovpn_crypto_key_slot, xmit_limit) <=
+	      SMP_CACHE_BYTES);
 
 struct ovpn_crypto_state {
 	struct ovpn_crypto_key_slot __rcu *slots[2];

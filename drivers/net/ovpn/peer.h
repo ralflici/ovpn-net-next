@@ -56,10 +56,10 @@
  * @last_recv: timestamp of the last authenticated received packet
  * @delete_reason: why peer was deleted (i.e. timeout, transport error, ..)
  * @lock: protects binding to peer (bind) and keepalive* fields
- * @refcount: reference counter
  * @rcu: used to free peer in an RCU safe way
  * @release_entry: entry for the socket release list
  * @keepalive_work: used to schedule keepalive sending
+ * @refcount: reference counter
  * @vpn_stats: per-CPU in-VPN TX/RX stats
  * @link_stats: per-CPU link/transport TX/RX stats
  */
@@ -110,15 +110,16 @@ struct ovpn_peer {
 	time64_t last_recv;
 	enum ovpn_del_peer_reason delete_reason;
 	spinlock_t lock; /* protects bind  and keepalive* */
-	struct percpu_ref refcount;
 	struct rcu_head rcu;
 	struct llist_node release_entry;
 	struct work_struct keepalive_work;
 
-	__cacheline_group_begin_aligned(stats_ro);
+	/* read on the packet path but written only at setup and teardown */
+	__cacheline_group_begin_aligned(read_mostly);
+	struct percpu_ref refcount;
 	struct pcpu_sw_netstats __percpu *vpn_stats;
 	struct pcpu_sw_netstats __percpu *link_stats;
-	__cacheline_group_end_aligned(stats_ro);
+	__cacheline_group_end_aligned(read_mostly);
 };
 
 /**
