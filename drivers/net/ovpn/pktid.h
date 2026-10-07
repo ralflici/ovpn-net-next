@@ -24,9 +24,19 @@
 /* notify userspace when the packet ID space is close to wrapping */
 #define PKTID_XMIT_REKEY_NOTIFY 0xff000000U
 #define PKTID_DIRECT_MAX U32_MAX
-#define PKTID_EPOCH_SEQ_MAX GENMASK_ULL(47, 0)
 #define PKTID_EPOCH_MASK GENMASK_ULL(63, 48)
-#define PKTID_EPOCH_SEQ_MASK GENMASK_ULL(47, 0)
+#define PKTID_EPOCH_COUNTER_MASK GENMASK_ULL(47, 0)
+#define PKTID_EPOCH_COUNTER_MAX FIELD_MAX(PKTID_EPOCH_COUNTER_MASK)
+
+/* A lane-enabled epoch counter uses the upper 12 bits as a lane ID and
+ * leaves a 36-bit sequence in each lane. Keep this split independent of the
+ * cipher so every negotiated lane format has the same packet-ID layout.
+ */
+#define PKTID_EPOCH_LANE_BITS 12
+#define PKTID_EPOCH_LANE_MASK GENMASK_ULL(47, 36)
+#define PKTID_EPOCH_LANE_MAX FIELD_MAX(PKTID_EPOCH_LANE_MASK)
+#define PKTID_EPOCH_LANE_SEQ_MASK GENMASK_ULL(35, 0)
+#define PKTID_EPOCH_LANE_SEQ_MAX FIELD_MAX(PKTID_EPOCH_LANE_SEQ_MASK)
 
 /* Packet-ID state for transmitter */
 struct ovpn_pktid_xmit {
@@ -69,11 +79,27 @@ static inline void ovpn_pktid_xmit_limit_init(struct ovpn_limit *limit,
 {
 	if (epoch_format) {
 		limit->soft = U64_MAX;
-		limit->hard = PKTID_EPOCH_SEQ_MAX;
+		limit->hard = PKTID_EPOCH_COUNTER_MAX;
 	} else {
 		limit->soft = PKTID_XMIT_REKEY_NOTIFY;
 		limit->hard = PKTID_DIRECT_MAX;
 	}
+}
+
+static inline u64 ovpn_pktid_epoch_lane_compose(u16 lane, u64 seq)
+{
+	return FIELD_PREP(PKTID_EPOCH_LANE_MASK, lane) |
+	       FIELD_PREP(PKTID_EPOCH_LANE_SEQ_MASK, seq);
+}
+
+static inline u16 ovpn_pktid_epoch_lane(u64 counter)
+{
+	return FIELD_GET(PKTID_EPOCH_LANE_MASK, counter);
+}
+
+static inline u64 ovpn_pktid_epoch_lane_seq(u64 counter)
+{
+	return FIELD_GET(PKTID_EPOCH_LANE_SEQ_MASK, counter);
 }
 
 /**
@@ -135,7 +161,7 @@ static inline u64 ovpn_pktid_aead_write(u16 epoch, u64 seq,
 {
 	/* epoch packets carry a 16-bit epoch and 48-bit counter */
 	u64 pktid = FIELD_PREP(PKTID_EPOCH_MASK, epoch) |
-		    FIELD_PREP(PKTID_EPOCH_SEQ_MASK, seq);
+		    FIELD_PREP(PKTID_EPOCH_COUNTER_MASK, seq);
 
 	if (epoch) {
 		u64 iv_head = get_unaligned_be64(implicit_iv);
@@ -162,7 +188,7 @@ static inline u64 ovpn_pktid_read(const u8 *buf, bool epoch_format,
 	if (epoch_format) {
 		pktid = get_unaligned_be64(buf);
 		*epoch = FIELD_GET(PKTID_EPOCH_MASK, pktid);
-		return FIELD_GET(PKTID_EPOCH_SEQ_MASK, pktid);
+		return FIELD_GET(PKTID_EPOCH_COUNTER_MASK, pktid);
 	}
 
 	*epoch = 0;
