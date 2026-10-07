@@ -77,7 +77,13 @@ error:
 
 static void ovpn_key_ctx_free_state(struct ovpn_key_ctx *key)
 {
+	struct ovpn_pktid_recv *lane;
+	unsigned long index;
+
 	kfree(key->pktid_recv);
+	xa_for_each(&key->recv_lanes, index, lane)
+		kfree(lane);
+	xa_destroy(&key->recv_lanes);
 	kvfree(key->xmit_lanes);
 	if (key->tfm)
 		crypto_free_aead(key->tfm);
@@ -113,17 +119,7 @@ void ovpn_key_ctx_release(struct percpu_ref *ref)
 	queue_work(ovpn_wq, &key->free_work);
 }
 
-/**
- * ovpn_key_ctx_replay_state - return replay state for an authenticated packet
- * @key: receive key context that authenticated the packet
- *
- * Replay state is allocated only after a receive key authenticates traffic.
- * Concurrent completions can reach this function for the same key, so only
- * the first allocation is installed and the others are discarded.
- *
- * Return: replay state on success or NULL if allocation failed
- */
-struct ovpn_pktid_recv *
+static struct ovpn_pktid_recv *
 ovpn_key_ctx_replay_state(struct ovpn_key_ctx *key)
 {
 	struct ovpn_pktid_recv *new, *recv;
@@ -151,6 +147,65 @@ ovpn_key_ctx_replay_state(struct ovpn_key_ctx *key)
 	return recv;
 }
 
+static struct ovpn_pktid_recv *
+ovpn_key_ctx_replay_lane(struct ovpn_key_ctx *key, u16 lane_id)
+{
+	struct ovpn_pktid_recv *new, *recv;
+	void *old;
+
+	recv = xa_load(&key->recv_lanes, lane_id);
+	if (likely(recv))
+		return recv;
+
+	/* packets allocate only the lane which authenticated traffic */
+	new = kmalloc_obj(*new, GFP_ATOMIC | __GFP_NOWARN);
+	if (unlikely(!new))
+		return NULL;
+
+	ovpn_pktid_recv_init(new);
+	/* another completion may have installed this lane while allocating */
+	old = xa_cmpxchg_bh(&key->recv_lanes, lane_id, NULL, new,
+			    GFP_ATOMIC | __GFP_NOWARN);
+	if (unlikely(xa_is_err(old))) {
+		kfree(new);
+		return NULL;
+	}
+	if (unlikely(old)) {
+		kfree(new);
+		return old;
+	}
+
+	return new;
+}
+
+/**
+ * ovpn_key_ctx_replay - check an authenticated packet for replay
+ * @key: receive key context that authenticated the packet
+ * @pktid: packet ID read from the authenticated header
+ *
+ * Replay state is allocated only after authentication. Epoch keys without
+ * lanes retain the existing replay window, while lane-enabled keys allocate
+ * an independent window only for lanes which receive traffic.
+ *
+ * Return: 0 if the packet ID is accepted or a negative error code otherwise
+ */
+int ovpn_key_ctx_replay(struct ovpn_key_ctx *key, u64 pktid)
+{
+	struct ovpn_pktid_recv *recv;
+
+	if (!key->lane_bits) {
+		recv = ovpn_key_ctx_replay_state(key);
+	} else {
+		recv = ovpn_key_ctx_replay_lane(key,
+						ovpn_pktid_epoch_lane(pktid));
+		pktid = ovpn_pktid_epoch_lane_seq(pktid);
+	}
+	if (unlikely(!recv))
+		return -ENOMEM;
+
+	return ovpn_pktid_recv(recv, pktid, 0);
+}
+
 static struct ovpn_key_ctx *
 ovpn_key_ctx_new(const char *title, const char *alg_name,
 		 const u8 *cipher_key, unsigned int cipher_key_len,
@@ -166,6 +221,8 @@ ovpn_key_ctx_new(const char *title, const char *alg_name,
 	if (!key)
 		return ERR_PTR(-ENOMEM);
 	key->pktid_recv = NULL;
+	/* replay lanes may be inserted from either process or softirq context */
+	xa_init_flags(&key->recv_lanes, XA_FLAGS_LOCK_BH);
 	key->xmit_lanes = NULL;
 	key->lane_bits = lane_bits;
 
@@ -575,7 +632,8 @@ static int ovpn_epoch_key_init(struct ovpn_epoch_key *epoch_key,
 }
 
 struct ovpn_crypto_key_slot *
-ovpn_crypto_key_slot_new(const struct ovpn_key_config *kc, u8 tx_lane_bits)
+ovpn_crypto_key_slot_new(const struct ovpn_key_config *kc, u8 tx_lane_bits,
+			 u8 rx_lane_bits)
 {
 	struct ovpn_crypto_key_slot *ks = NULL;
 	unsigned int direct_payload_offset;
@@ -663,7 +721,8 @@ ovpn_crypto_key_slot_new(const struct ovpn_key_config *kc, u8 tx_lane_bits)
 		spin_lock_init(&ks->rx_lock);
 		seqcount_spinlock_init(&ks->rx_seqcount, &ks->rx_lock);
 		key = ovpn_key_ctx_create_epoch(false, alg_name,
-						&ks->epoch_key_recv, 0);
+						&ks->epoch_key_recv,
+						rx_lane_bits);
 	} else {
 		key = ovpn_key_ctx_create_direct(false, alg_name,
 						 &kc->direct.decrypt);
@@ -686,7 +745,8 @@ ovpn_crypto_key_slot_new(const struct ovpn_key_config *kc, u8 tx_lane_bits)
 
 		ret = ovpn_epoch_init_future_keys(false, alg_name,
 						  &ks->epoch_key_recv,
-						  &ks->future_rx_keys, 0);
+						  &ks->future_rx_keys,
+						  rx_lane_bits);
 		if (ret)
 			goto destroy_ks;
 	}

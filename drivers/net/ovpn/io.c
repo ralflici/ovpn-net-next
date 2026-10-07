@@ -293,7 +293,6 @@ static int ovpn_check_rotate_keys(struct ovpn_peer *peer,
 
 void ovpn_decrypt_post(void *data, int ret)
 {
-	struct ovpn_pktid_recv *pktid_recv;
 	struct ovpn_crypto_key_slot *ks;
 	unsigned int payload_offset = 0;
 	struct sk_buff *skb = data;
@@ -332,14 +331,9 @@ void ovpn_decrypt_post(void *data, int ret)
 	if (unlikely(ret < 0))
 		goto drop;
 
-	/* retrieve or allocate the replay state */
-	pktid_recv = ovpn_key_ctx_replay_state(key);
-	if (unlikely(!pktid_recv))
-		goto drop;
-
 	pktid = ovpn_pktid_read(skb->data + OVPN_OPCODE_SIZE,
 				ks->epoch_format, &pkt_epoch);
-	ret = ovpn_pktid_recv(pktid_recv, pktid, 0);
+	ret = ovpn_key_ctx_replay(key, pktid);
 	if (unlikely(ret < 0)) {
 		net_err_ratelimited("%s: PKT ID RX error for peer %u: %d\n",
 				    netdev_name(peer->ovpn->dev), peer->id,

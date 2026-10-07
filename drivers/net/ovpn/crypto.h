@@ -14,6 +14,7 @@
 #include <linux/rcupdate.h>
 #include <linux/seqlock.h>
 #include <linux/workqueue.h>
+#include <linux/xarray.h>
 
 #include "crypto_epoch.h"
 #include "crypto_limits.h"
@@ -71,6 +72,8 @@ struct ovpn_key_ctx {
 
 	/* allocated after an RX key first authenticates a packet */
 	struct ovpn_pktid_recv *pktid_recv;
+	/* replay windows allocated for authenticated epoch lanes */
+	struct xarray recv_lanes;
 	struct ovpn_xmit_lane *xmit_lanes;
 	struct ovpn_pktid_xmit pktid_xmit ____cacheline_aligned_in_smp;
 
@@ -263,13 +266,14 @@ static inline int ovpn_key_ctx_get(struct ovpn_key_ctx **out,
 }
 
 void ovpn_crypto_key_slot_kill_contexts(struct ovpn_crypto_key_slot *ks);
-struct ovpn_pktid_recv *ovpn_key_ctx_replay_state(struct ovpn_key_ctx *key);
+int ovpn_key_ctx_replay(struct ovpn_key_ctx *key, u64 pktid);
 
 int ovpn_crypto_state_reset(struct ovpn_crypto_state *cs,
 			    const struct ovpn_peer_key_reset *pkr);
 
 struct ovpn_crypto_key_slot *
-ovpn_crypto_key_slot_new(const struct ovpn_key_config *kc, u8 tx_lane_bits);
+ovpn_crypto_key_slot_new(const struct ovpn_key_config *kc, u8 tx_lane_bits,
+			 u8 rx_lane_bits);
 
 enum ovpn_cipher_alg ovpn_crypto_key_slot_alg(struct ovpn_crypto_key_slot *ks);
 
