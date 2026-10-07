@@ -128,6 +128,7 @@ static_assert(offsetofend(struct ovpn_crypto_key_slot, xmit_limit) <=
 struct ovpn_crypto_state {
 	struct ovpn_crypto_key_slot __rcu *slots[2];
 	u8 primary_idx;
+	u8 rx_lane_bits;
 
 	/* protects primary and secondary slots */
 	spinlock_t lock;
@@ -143,6 +144,7 @@ static inline void ovpn_crypto_state_init(struct ovpn_crypto_state *cs)
 	RCU_INIT_POINTER(cs->slots[0], NULL);
 	RCU_INIT_POINTER(cs->slots[1], NULL);
 	cs->primary_idx = 0;
+	cs->rx_lane_bits = 0;
 	spin_lock_init(&cs->lock);
 }
 

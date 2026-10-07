@@ -681,6 +681,15 @@ int ovpn_aead_decrypt(struct ovpn_peer *peer, struct ovpn_crypto_key_slot *ks,
 	/* epoch packet ID includes both epoch and per-epoch counter */
 	pkt_seq = ovpn_pktid_read(skb->data + OVPN_OPCODE_SIZE,
 				  ks->epoch_format, &pkt_epoch);
+	/* lane fields are authenticated only after crypto completes, but
+	 * malformed values can be rejected without changing any receive state;
+	 * READ_ONCE() pairs with the netlink update that enables the format
+	 */
+	ret = ovpn_pktid_epoch_lane_valid(pkt_seq,
+					  READ_ONCE(peer->crypto.rx_lane_bits));
+	if (unlikely(!ret))
+		return -EINVAL;
+
 	key = ovpn_aead_decrypt_key(ks, pkt_epoch);
 	if (IS_ERR(key))
 		return PTR_ERR(key);

@@ -102,6 +102,17 @@ static inline u64 ovpn_pktid_epoch_lane_seq(u64 counter)
 	return FIELD_GET(PKTID_EPOCH_LANE_SEQ_MASK, counter);
 }
 
+static inline bool ovpn_pktid_epoch_lane_valid(u64 counter, u8 lane_bits)
+{
+	u16 lane;
+
+	if (!lane_bits)
+		return true;
+
+	lane = ovpn_pktid_epoch_lane(counter);
+	return lane < BIT(lane_bits) && ovpn_pktid_epoch_lane_seq(counter);
+}
+
 /**
  * ovpn_pktid_xmit_reserve - reserve consecutive transmit packet IDs
  * @pid: transmit packet ID state
