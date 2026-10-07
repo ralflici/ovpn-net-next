@@ -48,6 +48,7 @@ struct ovpn_pktid_xmit {
 /* keep independently updated transmit lanes on separate cache lines */
 struct ovpn_xmit_lane {
 	atomic64_t seq_num;
+	atomic64_t usage_credit;
 } ____cacheline_aligned_in_smp;
 
 /* replay window sizing in bytes = 2^REPLAY_WINDOW_ORDER */
@@ -176,6 +177,7 @@ static inline void
 ovpn_xmit_lane_init(struct ovpn_xmit_lane *lane)
 {
 	atomic64_set(&lane->seq_num, 1);
+	atomic64_set(&lane->usage_credit, 0);
 }
 
 /* write the AEAD IV to dest */

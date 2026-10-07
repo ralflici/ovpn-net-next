@@ -28,6 +28,10 @@
 #define OVPN_AEAD_DECRYPT_FAILURE_NOTIFY	BIT_ULL(35)
 #define OVPN_AEAD_DECRYPT_FAILURE_LIMIT		BIT_ULL(36)
 
+/* amortize shared epoch usage accounting across lane-local packets */
+#define OVPN_KEY_USAGE_CREDIT_ORDER		18
+#define OVPN_KEY_USAGE_CREDIT_CHUNK BIT_ULL(OVPN_KEY_USAGE_CREDIT_ORDER)
+
 static bool
 ovpn_aead_decrypt_failure_exceeded(const struct ovpn_key_ctx *key)
 {
@@ -273,6 +277,58 @@ void ovpn_request_encrypt_epoch(struct ovpn_crypto_key_slot *ks,
 		;
 }
 
+static int ovpn_key_usage_xmit_lane(atomic64_t *usage, atomic64_t *credit,
+				    const struct ovpn_limit *limit,
+				    unsigned int packets, u64 blocks)
+{
+	u64 available, grant, new_usage, units = packets + blocks;
+	s64 old_credit, old_usage;
+
+	old_credit = atomic64_read(credit);
+retry:
+	/* consume existing credit; cmpxchg refreshes it after a TX race */
+	while ((u64)old_credit >= units) {
+		if (atomic64_try_cmpxchg_relaxed(credit, &old_credit,
+						 old_credit - units))
+			return 0;
+	}
+
+	old_usage = atomic64_read(usage);
+	for (;;) {
+		/* unused credits cannot be borrowed from another lane */
+		if (unlikely((u64)old_usage >= limit->hard))
+			goto exhausted;
+
+		available = limit->hard - (u64)old_usage;
+		if (unlikely(available < units))
+			goto exhausted;
+
+		/* reserve a full chunk unless the epoch is near exhaustion */
+		grant = max_t(u64, units, OVPN_KEY_USAGE_CREDIT_CHUNK);
+		grant = min(grant, available);
+		new_usage = (u64)old_usage + grant;
+		if (!atomic64_try_cmpxchg_relaxed(usage, &old_usage, new_usage))
+			continue;
+
+		/* consume this packet and leave the remainder with the lane */
+		if (grant > units)
+			atomic64_add(grant - units, credit);
+
+		/* let the caller know if we are close to the soft limit */
+		return new_usage > limit->soft;
+	}
+
+exhausted:
+	/* a concurrent refill may have published enough lane credit while the
+	 * shared allocator appeared exhausted
+	 */
+	old_credit = atomic64_read(credit);
+	if ((u64)old_credit >= units)
+		goto retry;
+
+	return -ERANGE;
+}
+
 /**
  * ovpn_aead_encrypt_reserve - reserve packet IDs and cipher usage
  * @peer: peer that owns the key slot
@@ -293,6 +349,7 @@ int ovpn_aead_encrypt_reserve(struct ovpn_peer *peer,
 			      bool canonical, u64 *first_id)
 {
 	atomic64_t *seq_num = &encrypt->pktid_xmit.seq_num;
+	struct ovpn_xmit_lane *xmit_lane = NULL;
 	u64 hard = encrypt->pktid_xmit.limit.hard;
 	u64 soft = encrypt->pktid_xmit.limit.soft;
 	unsigned int target_epoch;
@@ -313,7 +370,8 @@ int ovpn_aead_encrypt_reserve(struct ovpn_peer *peer,
 		if (unlikely(canonical))
 			lane = 0;
 
-		seq_num = &encrypt->xmit_lanes[lane].seq_num;
+		xmit_lane = &encrypt->xmit_lanes[lane];
+		seq_num = &xmit_lane->seq_num;
 		soft = U64_MAX;
 		hard = PKTID_EPOCH_LANE_SEQ_MAX;
 	}
@@ -325,16 +383,22 @@ int ovpn_aead_encrypt_reserve(struct ovpn_peer *peer,
 		must_rotate = true;
 	} else {
 		notify = ret > 0;
-
-		if (encrypt->lane_bits)
-			*first_id = ovpn_pktid_epoch_lane_compose(lane,
-								  *first_id);
-
 		aead_blocks = packets * ovpn_aead_limit_blocks(ks->cipher_alg,
 							       ks->aad_size,
 							       plaintext_len);
-		ret = ovpn_key_usage_xmit(&encrypt->xmit_usage, &ks->xmit_limit,
-					  packets, aead_blocks);
+
+		if (xmit_lane) {
+			*first_id = ovpn_pktid_epoch_lane_compose(lane,
+								  *first_id);
+			ret = ovpn_key_usage_xmit_lane(&encrypt->xmit_usage,
+						       &xmit_lane->usage_credit,
+						       &ks->xmit_limit, packets,
+						       aead_blocks);
+		} else {
+			ret = ovpn_key_usage_xmit(&encrypt->xmit_usage,
+						  &ks->xmit_limit, packets,
+						  aead_blocks);
+		}
 		if (unlikely(ret < 0)) {
 			/* epoch keys rotate at the hard limit */
 			if (!ks->epoch_format)
