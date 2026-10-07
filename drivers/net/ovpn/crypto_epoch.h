@@ -34,6 +34,8 @@ struct ovpn_future_keys {
 	u16 head;
 	u16 tail;
 	bool full;
+	/* immutable packet-ID format used by every key in this ring */
+	u8 lane_bits;
 };
 
 static inline u16

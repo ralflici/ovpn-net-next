@@ -28,6 +28,7 @@
  * @key: key context used by this operation or owned by this aggregate
  * @payload_offset: offset in the skb where the payload starts
  * @nosignal: whether this skb should be sent with the MSG_NOSIGNAL flag (TCP)
+ * @canonical: whether this skb must use the canonical transmit lane
  * @batch: UDP GSO aggregate receiving this input skb's encrypted payload
  * @batch_state: completion state owned by a UDP GSO aggregate
  */
@@ -45,6 +46,7 @@ struct ovpn_cb {
 		struct {
 			unsigned int payload_offset;
 			bool nosignal;
+			bool canonical;
 		};
 		struct sk_buff *batch;
 		struct {

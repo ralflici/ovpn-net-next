@@ -9,6 +9,7 @@
 
 #include <crypto/aead.h>
 #include <linux/skbuff.h>
+#include <linux/smp.h>
 #include <net/ip.h>
 #include <net/ipv6.h>
 #include <net/udp.h>
@@ -279,7 +280,8 @@ void ovpn_request_encrypt_epoch(struct ovpn_crypto_key_slot *ks,
  * @encrypt: concrete transmit key context
  * @packets: number of equal-sized packets in the reservation
  * @plaintext_len: plaintext length charged for each packet
- * @first_seq: location where the first reserved packet ID is stored
+ * @canonical: whether the packet must use the canonical lane
+ * @first_id: location where the first reserved counter is stored
  *
  * Return: 0 on success, -EAGAIN after promoting an epoch key so the caller can
  * retry with the new context, or another negative error code on failure
@@ -288,22 +290,46 @@ int ovpn_aead_encrypt_reserve(struct ovpn_peer *peer,
 			      struct ovpn_crypto_key_slot *ks,
 			      struct ovpn_key_ctx *encrypt,
 			      unsigned int packets, unsigned int plaintext_len,
-			      u64 *first_seq)
+			      bool canonical, u64 *first_id)
 {
+	atomic64_t *seq_num = &encrypt->pktid_xmit.seq_num;
+	u64 hard = encrypt->pktid_xmit.limit.hard;
+	u64 soft = encrypt->pktid_xmit.limit.soft;
 	unsigned int target_epoch;
 	bool must_rotate = false;
+	u16 lane_mask, lane;
 	bool notify = false;
 	u64 aead_blocks;
 	int ret;
 
 	/* reserve every nonce before charging the cipher usage budget */
-	ret = ovpn_pktid_xmit_reserve(&encrypt->pktid_xmit, packets, first_seq);
+	if (encrypt->lane_bits) {
+		/* all lanes carry data while canonical traffic uses lane zero */
+		lane_mask = BIT(encrypt->lane_bits) - 1;
+		/* migration after this sample only changes cache locality
+		 * because the selected lane reserves its sequence atomically
+		 */
+		lane = raw_smp_processor_id() & lane_mask;
+		if (unlikely(canonical))
+			lane = 0;
+
+		seq_num = &encrypt->xmit_lanes[lane].seq_num;
+		soft = U64_MAX;
+		hard = PKTID_EPOCH_LANE_SEQ_MAX;
+	}
+
+	ret = ovpn_pktid_xmit_reserve(seq_num, soft, hard, packets, first_id);
 	if (unlikely(ret < 0)) {
 		if (!ks->epoch_format)
 			return ret;
 		must_rotate = true;
 	} else {
 		notify = ret > 0;
+
+		if (encrypt->lane_bits)
+			*first_id = ovpn_pktid_epoch_lane_compose(lane,
+								  *first_id);
+
 		aead_blocks = packets * ovpn_aead_limit_blocks(ks->cipher_alg,
 							       ks->aad_size,
 							       plaintext_len);
@@ -392,7 +418,8 @@ retry:
 
 	tag_size = crypto_aead_authsize(key->tfm);
 
-	ret = ovpn_aead_encrypt_reserve(peer, ks, key, 1, plaintext_len, &seq);
+	ret = ovpn_aead_encrypt_reserve(peer, ks, key, 1, plaintext_len,
+					ovpn_skb_cb(skb)->canonical, &seq);
 	if (unlikely(ret == -EAGAIN)) {
 		/* retry with the promoted epoch key */
 		ovpn_skb_cb(skb)->key = NULL;

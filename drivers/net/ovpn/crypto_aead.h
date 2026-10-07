@@ -22,7 +22,7 @@ int ovpn_aead_encrypt_reserve(struct ovpn_peer *peer,
 			      struct ovpn_crypto_key_slot *ks,
 			      struct ovpn_key_ctx *encrypt,
 			      unsigned int packets, unsigned int plaintext_len,
-			      u64 *first_seq);
+			      bool canonical, u64 *first_id);
 
 int ovpn_aead_encrypt(struct ovpn_peer *peer, struct ovpn_crypto_key_slot *ks,
 		      struct sk_buff *skb);

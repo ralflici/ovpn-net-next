@@ -602,7 +602,6 @@ static bool ovpn_encrypt_one(struct ovpn_peer *peer, struct sk_buff *skb)
 	if (unlikely(!ks))
 		return false;
 
-	memset(ovpn_skb_cb(skb), 0, sizeof(struct ovpn_cb));
 	ovpn_encrypt_post(skb, ovpn_aead_encrypt(peer, ks, skb));
 	return true;
 }
@@ -715,7 +714,8 @@ retry:
 	 * tail is conservatively overcounted without another list inspection
 	 */
 	ret = ovpn_aead_encrypt_reserve(peer, ks, key, segments,
-					skb_peek(skbs)->len, &first_pktid);
+					skb_peek(skbs)->len, false,
+					&first_pktid);
 	if (unlikely(ret == -EAGAIN)) {
 		/* keys have rotated so try reserving again with the new key */
 		ovpn_key_ctx_put(key);
@@ -925,6 +925,9 @@ netdev_tx_t ovpn_net_xmit(struct sk_buff *skb, struct net_device *dev)
 			continue;
 		}
 
+		/* ordinary data traffic does not use the canonical lane */
+		memset(ovpn_skb_cb(curr), 0, sizeof(struct ovpn_cb));
+
 		/* only count what we actually send */
 		tx_bytes += curr->len;
 		__skb_queue_tail(&skb_list, curr);
@@ -988,6 +991,8 @@ void ovpn_xmit_special(struct ovpn_peer *peer, const void *data,
 	skb_reserve(skb, 128);
 	skb->priority = TC_PRIO_BESTEFFORT;
 	__skb_put_data(skb, data, len);
+	memset(ovpn_skb_cb(skb), 0, sizeof(struct ovpn_cb));
+	ovpn_skb_cb(skb)->canonical = true;
 
 	ovpn_send(ovpn, skb, peer);
 }

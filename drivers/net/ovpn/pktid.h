@@ -14,6 +14,7 @@
 #include "proto.h"
 
 #include <linux/bitfield.h>
+#include <linux/cache.h>
 #include <linux/unaligned.h>
 
 /* If no packets received for this length of time, set a backtrack floor
@@ -43,6 +44,11 @@ struct ovpn_pktid_xmit {
 	atomic64_t seq_num;
 	struct ovpn_limit limit;
 };
+
+/* keep independently updated transmit lanes on separate cache lines */
+struct ovpn_xmit_lane {
+	atomic64_t seq_num;
+} ____cacheline_aligned_in_smp;
 
 /* replay window sizing in bytes = 2^REPLAY_WINDOW_ORDER */
 #define REPLAY_WINDOW_ORDER 8
@@ -115,7 +121,9 @@ static inline bool ovpn_pktid_epoch_lane_valid(u64 counter, u8 lane_bits)
 
 /**
  * ovpn_pktid_xmit_reserve - reserve consecutive transmit packet IDs
- * @pid: transmit packet ID state
+ * @seq_num: atomic counter to reserve from
+ * @soft: threshold that requests a key change
+ * @hard: last usable counter value
  * @count: non-zero number of IDs to reserve
  * @pktid: location where the first reserved packet ID is stored
  *
@@ -129,10 +137,11 @@ static inline bool ovpn_pktid_epoch_lane_valid(u64 counter, u8 lane_bits)
  * Return: 1 when the reservation crosses the soft limit, 0 otherwise, or
  * -ERANGE when the complete range cannot be reserved
  */
-static inline int ovpn_pktid_xmit_reserve(struct ovpn_pktid_xmit *pid,
-					  unsigned int count, u64 *pktid)
+static inline int ovpn_pktid_xmit_reserve(atomic64_t *seq_num, u64 soft,
+					  u64 hard, unsigned int count,
+					  u64 *pktid)
 {
-	s64 old = atomic64_read(&pid->seq_num);
+	s64 old = atomic64_read(seq_num);
 	u64 first, next;
 	bool fits;
 
@@ -141,10 +150,10 @@ static inline int ovpn_pktid_xmit_reserve(struct ovpn_pktid_xmit *pid,
 		next = first + count;
 
 		/* packet IDs create cipher IVs and must not wrap */
-		if (unlikely(!old || first > pid->limit.hard))
+		if (unlikely(!old || first > hard))
 			return -ERANGE;
 
-		fits = count - 1 <= pid->limit.hard - first;
+		fits = count - 1 <= hard - first;
 		/* publish exhaustion if the complete range does not fit so
 		 * concurrent allocators stop using this key
 		 */
@@ -152,17 +161,21 @@ static inline int ovpn_pktid_xmit_reserve(struct ovpn_pktid_xmit *pid,
 			next = 0;
 
 		/* ID allocation only requires atomicity, not ordering */
-		if (!atomic64_try_cmpxchg_relaxed(&pid->seq_num, &old,
-						  (s64)next))
+		if (!atomic64_try_cmpxchg_relaxed(seq_num, &old, (s64)next))
 			continue;
 
 		if (unlikely(!fits))
 			return -ERANGE;
 
 		*pktid = first;
-		return first <= pid->limit.soft &&
-		       pid->limit.soft - first < count;
+		return first <= soft && soft - first < count;
 	}
+}
+
+static inline void
+ovpn_xmit_lane_init(struct ovpn_xmit_lane *lane)
+{
+	atomic64_set(&lane->seq_num, 1);
 }
 
 /* write the AEAD IV to dest */

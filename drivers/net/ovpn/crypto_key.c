@@ -9,6 +9,7 @@
 
 #include <crypto/aead.h>
 #include <crypto/hash.h>
+#include <linux/slab.h>
 #include <linux/workqueue.h>
 
 #include "ovpnpriv.h"
@@ -77,6 +78,7 @@ error:
 static void ovpn_key_ctx_free_state(struct ovpn_key_ctx *key)
 {
 	kfree(key->pktid_recv);
+	kvfree(key->xmit_lanes);
 	if (key->tfm)
 		crypto_free_aead(key->tfm);
 	memzero_explicit(key->implicit_iv, sizeof(key->implicit_iv));
@@ -153,24 +155,39 @@ static struct ovpn_key_ctx *
 ovpn_key_ctx_new(const char *title, const char *alg_name,
 		 const u8 *cipher_key, unsigned int cipher_key_len,
 		 const u8 *implicit_iv, u16 epoch, bool epoch_format,
-		 bool encrypt)
+		 bool encrypt, u8 lane_bits)
 {
 	struct ovpn_limit pktid_limit;
 	struct ovpn_key_ctx *key;
+	unsigned int lane;
 	int ret;
 
 	key = kmalloc_obj(*key);
 	if (!key)
 		return ERR_PTR(-ENOMEM);
 	key->pktid_recv = NULL;
+	key->xmit_lanes = NULL;
+	key->lane_bits = lane_bits;
 
 	/* create the concrete AEAD transform first */
 	key->tfm = ovpn_aead_init(title, alg_name, cipher_key, cipher_key_len);
 	if (IS_ERR(key->tfm)) {
 		ret = PTR_ERR(key->tfm);
 		key->tfm = NULL;
-		ovpn_key_ctx_free(key);
-		return ERR_PTR(ret);
+		goto err;
+	}
+
+	if (encrypt && lane_bits) {
+		/* transmit lane state remains with its concrete epoch key */
+		key->xmit_lanes = kvcalloc(BIT(lane_bits),
+					   sizeof(*key->xmit_lanes), GFP_KERNEL);
+		if (!key->xmit_lanes) {
+			ret = -ENOMEM;
+			goto err;
+		}
+
+		for (lane = 0; lane < BIT(lane_bits); lane++)
+			ovpn_xmit_lane_init(&key->xmit_lanes[lane]);
 	}
 
 	/* store the implicit IV in a full nonce-sized buffer */
@@ -196,6 +213,10 @@ ovpn_key_ctx_new(const char *title, const char *alg_name,
 	}
 
 	return key;
+
+err:
+	ovpn_key_ctx_free(key);
+	return ERR_PTR(ret);
 }
 
 /* destroy an initialized context which has never been published */
@@ -220,7 +241,7 @@ ovpn_key_ctx_create_direct(bool encrypt, const char *alg_name,
 
 	key = ovpn_key_ctx_new(encrypt ? "encrypt" : "decrypt", alg_name,
 			       dir->cipher_key, dir->cipher_key_size,
-			       implicit_iv, 0, false, encrypt);
+			       implicit_iv, 0, false, encrypt, 0);
 	memzero_explicit(implicit_iv, sizeof(implicit_iv));
 
 	return key;
@@ -228,7 +249,7 @@ ovpn_key_ctx_create_direct(bool encrypt, const char *alg_name,
 
 struct ovpn_key_ctx *
 ovpn_key_ctx_create_epoch(bool encrypt, const char *alg_name,
-			  struct ovpn_epoch_key *epoch_key)
+			  struct ovpn_epoch_key *epoch_key, u8 lane_bits)
 {
 	u8 cipher_key[OVPN_EPOCH_PRK_SIZE], implicit_iv[OVPN_NONCE_SIZE];
 	struct ovpn_key_ctx *key;
@@ -242,7 +263,8 @@ ovpn_key_ctx_create_epoch(bool encrypt, const char *alg_name,
 
 	key = ovpn_key_ctx_new(encrypt ? "encrypt" : "decrypt", alg_name,
 			       cipher_key, epoch_key->cipher_key_len,
-			       implicit_iv, epoch_key->epoch, true, encrypt);
+			       implicit_iv, epoch_key->epoch, true, encrypt,
+			       lane_bits);
 
 out:
 	memzero_explicit(cipher_key, sizeof(cipher_key));
@@ -254,7 +276,8 @@ out:
 static int
 ovpn_epoch_init_future_keys(bool encrypt, const char *alg_name,
 			    struct ovpn_epoch_key *epoch_key,
-			    struct ovpn_future_keys *future_keys)
+			    struct ovpn_future_keys *future_keys,
+			    u8 lane_bits)
 {
 	struct ovpn_key_ctx *key;
 	int ret;
@@ -263,6 +286,7 @@ ovpn_epoch_init_future_keys(bool encrypt, const char *alg_name,
 	future_keys->head = 0;
 	future_keys->tail = 0;
 	future_keys->full = false;
+	future_keys->lane_bits = lane_bits;
 
 	/* each generated key advances the PRK and stores the next epoch */
 	for (i = 0; i < OVPN_EPOCH_FUTURE_KEYS_COUNT; i++) {
@@ -270,7 +294,8 @@ ovpn_epoch_init_future_keys(bool encrypt, const char *alg_name,
 		if (ret)
 			goto err;
 
-		key = ovpn_key_ctx_create_epoch(encrypt, alg_name, epoch_key);
+		key = ovpn_key_ctx_create_epoch(encrypt, alg_name, epoch_key,
+						lane_bits);
 		if (IS_ERR(key)) {
 			ret = PTR_ERR(key);
 			goto err;
@@ -373,7 +398,8 @@ static void ovpn_refill_future_buffer(struct ovpn_crypto_key_slot *ks,
 
 		new_futures[created] =
 			ovpn_key_ctx_create_epoch(encrypt, ks->alg_name,
-						  &scratch_key);
+						  &scratch_key,
+						  future_keys->lane_bits);
 		if (IS_ERR(new_futures[created])) {
 			ret = PTR_ERR(new_futures[created]);
 			goto err;
@@ -549,7 +575,7 @@ static int ovpn_epoch_key_init(struct ovpn_epoch_key *epoch_key,
 }
 
 struct ovpn_crypto_key_slot *
-ovpn_crypto_key_slot_new(const struct ovpn_key_config *kc)
+ovpn_crypto_key_slot_new(const struct ovpn_key_config *kc, u8 tx_lane_bits)
 {
 	struct ovpn_crypto_key_slot *ks = NULL;
 	unsigned int direct_payload_offset;
@@ -615,7 +641,8 @@ ovpn_crypto_key_slot_new(const struct ovpn_key_config *kc)
 		INIT_WORK(&ks->tx_refill, ovpn_refill_future_buffer_tx);
 		spin_lock_init(&ks->tx_lock);
 		key = ovpn_key_ctx_create_epoch(true, alg_name,
-						&ks->epoch_key_send);
+						&ks->epoch_key_send,
+						tx_lane_bits);
 	} else {
 		key = ovpn_key_ctx_create_direct(true, alg_name,
 						 &kc->direct.encrypt);
@@ -636,7 +663,7 @@ ovpn_crypto_key_slot_new(const struct ovpn_key_config *kc)
 		spin_lock_init(&ks->rx_lock);
 		seqcount_spinlock_init(&ks->rx_seqcount, &ks->rx_lock);
 		key = ovpn_key_ctx_create_epoch(false, alg_name,
-						&ks->epoch_key_recv);
+						&ks->epoch_key_recv, 0);
 	} else {
 		key = ovpn_key_ctx_create_direct(false, alg_name,
 						 &kc->direct.decrypt);
@@ -652,13 +679,14 @@ ovpn_crypto_key_slot_new(const struct ovpn_key_config *kc)
 		/* prederive future keys outside the fast path */
 		ret = ovpn_epoch_init_future_keys(true, alg_name,
 						  &ks->epoch_key_send,
-						  &ks->future_tx_keys);
+						  &ks->future_tx_keys,
+						  tx_lane_bits);
 		if (ret)
 			goto destroy_ks;
 
 		ret = ovpn_epoch_init_future_keys(false, alg_name,
 						  &ks->epoch_key_recv,
-						  &ks->future_rx_keys);
+						  &ks->future_rx_keys, 0);
 		if (ret)
 			goto destroy_ks;
 	}

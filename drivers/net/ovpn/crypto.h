@@ -63,12 +63,15 @@ struct ovpn_key_ctx {
 	struct crypto_aead *tfm;
 	u8 implicit_iv[OVPN_NONCE_SIZE];
 	u16 epoch;
+	/* zero retains the legacy epoch counter format */
+	u8 lane_bits;
 	/* RCU state recorded when this context is unpublished */
 	unsigned long rcu_state;
 	struct percpu_ref refcount;
 
 	/* allocated after an RX key first authenticates a packet */
 	struct ovpn_pktid_recv *pktid_recv;
+	struct ovpn_xmit_lane *xmit_lanes;
 	struct ovpn_pktid_xmit pktid_xmit ____cacheline_aligned_in_smp;
 
 	atomic64_t xmit_usage;
@@ -128,6 +131,8 @@ static_assert(offsetofend(struct ovpn_crypto_key_slot, xmit_limit) <=
 struct ovpn_crypto_state {
 	struct ovpn_crypto_key_slot __rcu *slots[2];
 	u8 primary_idx;
+	/* negotiated independently for each traffic direction */
+	u8 tx_lane_bits;
 	u8 rx_lane_bits;
 
 	/* protects primary and secondary slots */
@@ -144,6 +149,7 @@ static inline void ovpn_crypto_state_init(struct ovpn_crypto_state *cs)
 	RCU_INIT_POINTER(cs->slots[0], NULL);
 	RCU_INIT_POINTER(cs->slots[1], NULL);
 	cs->primary_idx = 0;
+	cs->tx_lane_bits = 0;
 	cs->rx_lane_bits = 0;
 	spin_lock_init(&cs->lock);
 }
@@ -263,7 +269,7 @@ int ovpn_crypto_state_reset(struct ovpn_crypto_state *cs,
 			    const struct ovpn_peer_key_reset *pkr);
 
 struct ovpn_crypto_key_slot *
-ovpn_crypto_key_slot_new(const struct ovpn_key_config *kc);
+ovpn_crypto_key_slot_new(const struct ovpn_key_config *kc, u8 tx_lane_bits);
 
 enum ovpn_cipher_alg ovpn_crypto_key_slot_alg(struct ovpn_crypto_key_slot *ks);
 
@@ -288,6 +294,6 @@ ovpn_key_ctx_create_direct(bool encrypt, const char *alg_name,
 
 struct ovpn_key_ctx *
 ovpn_key_ctx_create_epoch(bool encrypt, const char *alg_name,
-			  struct ovpn_epoch_key *epoch_key);
+			  struct ovpn_epoch_key *epoch_key, u8 lane_bits);
 
 #endif /* _NET_OVPN_OVPNCRYPTO_H_ */

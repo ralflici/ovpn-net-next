@@ -86,7 +86,9 @@ int ovpn_crypto_state_reset(struct ovpn_crypto_state *cs,
 	    pkr->slot != OVPN_KEY_SLOT_SECONDARY)
 		return -EINVAL;
 
-	new = ovpn_crypto_key_slot_new(&pkr->key);
+	/* sample once while netlink may publish a negotiated lane format */
+	new = ovpn_crypto_key_slot_new(&pkr->key,
+				       READ_ONCE(cs->tx_lane_bits));
 	if (IS_ERR(new))
 		return PTR_ERR(new);
 
