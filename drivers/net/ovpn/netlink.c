@@ -9,6 +9,7 @@
 #include <linux/netdevice.h>
 #include <linux/types.h>
 #include <net/genetlink.h>
+#include <net/ip.h>
 
 #include <uapi/linux/ovpn.h>
 
@@ -308,8 +309,18 @@ static int ovpn_nl_peer_modify(struct ovpn_peer *peer, struct genl_info *info,
 	/* In a multipeer-to-multipeer setup we may have asymmetric peer IDs,
 	 * that is peer->id might be different from peer->tx_id.
 	 */
-	if (attrs[OVPN_A_PEER_TX_ID])
+	if (attrs[OVPN_A_PEER_TX_ID]) {
+		if (READ_ONCE(peer->crypto.tx_lane_bits) &&
+		    nla_get_u32(attrs[OVPN_A_PEER_TX_ID]) ==
+		    OVPN_PEER_ID_UNDEF) {
+			NL_SET_ERR_MSG_MOD(info->extack,
+					   "TX lanes require a defined tx-id");
+			ret = -EINVAL;
+			goto err_unlock;
+		}
+
 		peer->tx_id = nla_get_u32(attrs[OVPN_A_PEER_TX_ID]);
+	}
 
 	if (attrs[OVPN_A_PEER_VPN_IPV4]) {
 		rehash = true;
@@ -344,6 +355,84 @@ err_unlock:
 	return ret;
 }
 
+static int ovpn_nl_peer_configure_lanes(struct ovpn_peer *peer,
+					struct socket *sock, u32 tx_id,
+					struct nlattr **attrs,
+					struct netlink_ext_ack *extack)
+{
+	const bool min_set = !!attrs[OVPN_A_PEER_SPORT_ENTROPY_TX_MIN];
+	const bool max_set = !!attrs[OVPN_A_PEER_SPORT_ENTROPY_TX_MAX];
+	u8 tx_bits = 0, rx_bits = 0;
+	u16 min = 0, max = 0, canonical;
+	unsigned int ports;
+	int low, high;
+
+	if (attrs[OVPN_A_PEER_EPOCH_TX_LANE_BITS])
+		tx_bits = nla_get_u8(attrs[OVPN_A_PEER_EPOCH_TX_LANE_BITS]);
+	if (attrs[OVPN_A_PEER_EPOCH_RX_LANE_BITS])
+		rx_bits = nla_get_u8(attrs[OVPN_A_PEER_EPOCH_RX_LANE_BITS]);
+
+	if (min_set != max_set) {
+		NL_SET_ERR_MSG_MOD(extack,
+				   "both entropy source-port bounds are required");
+		return -EINVAL;
+	}
+	if (!!tx_bits != min_set) {
+		NL_SET_ERR_MSG_MOD(extack,
+				   "TX lanes and source-port range are required together");
+		return -EINVAL;
+	}
+	if (!tx_bits && !rx_bits)
+		return 0;
+
+	if (sock->sk->sk_protocol != IPPROTO_UDP) {
+		NL_SET_ERR_MSG_MOD(extack,
+				   "epoch packet-ID lanes require UDP transport");
+		return -EINVAL;
+	}
+	if (rx_bits && peer->id == OVPN_PEER_ID_UNDEF) {
+		NL_SET_ERR_MSG_MOD(extack,
+				   "RX lanes require a defined peer ID");
+		return -EINVAL;
+	}
+	if (tx_bits && tx_id == OVPN_PEER_ID_UNDEF) {
+		NL_SET_ERR_MSG_MOD(extack,
+				   "TX lanes require a defined tx-id");
+		return -EINVAL;
+	}
+
+	if (tx_bits) {
+		min = nla_get_u16(attrs[OVPN_A_PEER_SPORT_ENTROPY_TX_MIN]);
+		max = nla_get_u16(attrs[OVPN_A_PEER_SPORT_ENTROPY_TX_MAX]);
+		if (!min && !max) {
+			inet_get_local_port_range(sock_net(sock->sk), &low, &high);
+			min = low;
+			max = high;
+		} else if (!min || !max || min > max) {
+			NL_SET_ERR_MSG_MOD(extack,
+					   "invalid entropy source-port range");
+			return -EINVAL;
+		}
+
+		canonical = ntohs(inet_sk(sock->sk)->inet_sport);
+		ports = max - min + 1;
+		if (canonical >= min && canonical <= max)
+			ports--;
+		if (!ports) {
+			NL_SET_ERR_MSG_MOD(extack,
+					   "entropy source-port range contains no usable port");
+			return -EINVAL;
+		}
+	}
+
+	peer->entropy_min = min;
+	peer->entropy_max = max;
+	WRITE_ONCE(peer->crypto.tx_lane_bits, tx_bits);
+	WRITE_ONCE(peer->crypto.rx_lane_bits, rx_bits);
+
+	return 0;
+}
+
 int ovpn_nl_peer_new_doit(struct sk_buff *skb, struct genl_info *info)
 {
 	struct nlattr *attrs[OVPN_A_PEER_MAX + 1];
@@ -351,7 +440,7 @@ int ovpn_nl_peer_new_doit(struct sk_buff *skb, struct genl_info *info)
 	struct ovpn_socket *ovpn_sock;
 	struct socket *sock = NULL;
 	struct ovpn_peer *peer;
-	u32 sockfd, peer_id;
+	u32 sockfd, peer_id, tx_id;
 	int ret;
 
 	if (GENL_REQ_ATTR_CHECK(info, OVPN_A_PEER))
@@ -379,6 +468,8 @@ int ovpn_nl_peer_new_doit(struct sk_buff *skb, struct genl_info *info)
 	}
 
 	peer_id = nla_get_u32(attrs[OVPN_A_PEER_ID]);
+	tx_id = attrs[OVPN_A_PEER_TX_ID] ?
+		nla_get_u32(attrs[OVPN_A_PEER_TX_ID]) : peer_id;
 
 	peer = ovpn_peer_new(ovpn, peer_id);
 	if (IS_ERR(peer)) {
@@ -397,6 +488,13 @@ int ovpn_nl_peer_new_doit(struct sk_buff *skb, struct genl_info *info)
 				       "cannot lookup peer socket (fd=%u): %d",
 				       sockfd, ret);
 		ret = -ENOTSOCK;
+		goto peer_release;
+	}
+
+	ret = ovpn_nl_peer_configure_lanes(peer, sock, tx_id, attrs,
+					   info->extack);
+	if (ret < 0) {
+		sockfd_put(sock);
 		goto peer_release;
 	}
 
@@ -556,6 +654,7 @@ static int ovpn_nl_send_peer(struct sk_buff *skb, const struct genl_info *info,
 	int ret = -EMSGSIZE;
 	struct nlattr *attr;
 	__be16 local_port;
+	u8 tx_bits, rx_bits;
 	void *hdr;
 	int id;
 
@@ -589,6 +688,18 @@ static int ovpn_nl_send_peer(struct sk_buff *skb, const struct genl_info *info,
 		goto err;
 
 	if (nla_put_u32(skb, OVPN_A_PEER_TX_ID, peer->tx_id))
+		goto err;
+	tx_bits = READ_ONCE(peer->crypto.tx_lane_bits);
+	rx_bits = READ_ONCE(peer->crypto.rx_lane_bits);
+	if (tx_bits &&
+	    (nla_put_u8(skb, OVPN_A_PEER_EPOCH_TX_LANE_BITS, tx_bits) ||
+	     nla_put_u16(skb, OVPN_A_PEER_SPORT_ENTROPY_TX_MIN,
+			 peer->entropy_min) ||
+	     nla_put_u16(skb, OVPN_A_PEER_SPORT_ENTROPY_TX_MAX,
+			 peer->entropy_max)))
+		goto err;
+	if (rx_bits &&
+	    nla_put_u8(skb, OVPN_A_PEER_EPOCH_RX_LANE_BITS, rx_bits))
 		goto err;
 
 	if (peer->vpn_addrs.ipv4.s_addr != htonl(INADDR_ANY))
