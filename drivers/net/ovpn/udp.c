@@ -26,6 +26,7 @@
 #include "io.h"
 #include "peer.h"
 #include "proto.h"
+#include "skb.h"
 #include "socket.h"
 #include "udp.h"
 
@@ -352,6 +353,37 @@ drop_noovpn:
 	return 0;
 }
 
+static __be16 ovpn_udp_src_port(const struct ovpn_peer *peer, struct sock *sk,
+				struct sk_buff *skb)
+{
+	u16 canonical, lane;
+	unsigned int index, port, ports;
+
+	canonical = ntohs(READ_ONCE(inet_sk(sk)->inet_sport));
+	/* the lane was selected before encryption and is shared by every
+	 * record in a UDP GSO aggregate
+	 */
+	lane = ovpn_skb_cb(skb)->xmit_lane;
+	if (!lane)
+		return htons(canonical);
+
+	/* fold nonzero lanes across the usable range while keeping lane zero's
+	 * canonical port out of it
+	 */
+	ports = peer->entropy_max - peer->entropy_min + 1;
+	if (canonical >= peer->entropy_min && canonical <= peer->entropy_max)
+		ports--;
+	index = lane - 1;
+	/* a range large enough for every lane needs no division */
+	if (unlikely(index >= ports))
+		index %= ports;
+	port = peer->entropy_min + index;
+	if (canonical >= peer->entropy_min && canonical <= port)
+		port++;
+
+	return htons(port);
+}
+
 /**
  * ovpn_udp4_output - send IPv4 packet over udp socket
  * @peer: the destination peer
@@ -375,6 +407,7 @@ static int ovpn_udp4_output(struct ovpn_peer *peer, struct ovpn_bind *bind,
 		.flowi4_proto = sk->sk_protocol,
 		.flowi4_mark = sk->sk_mark,
 	};
+	__be16 src_port;
 	int ret;
 
 	local_bh_disable();
@@ -417,11 +450,12 @@ static int ovpn_udp4_output(struct ovpn_peer *peer, struct ovpn_bind *bind,
 	dst_cache_set_ip4(cache, &rt->dst, fl.saddr);
 
 transmit:
+	src_port = ovpn_udp_src_port(peer, sk, skb);
 	/* an already-built UDP GSO needs a checksum seed even if the socket's
 	 * no-check option changed while encryption was in flight
 	 */
 	udp_tunnel_xmit_skb(rt, sk, skb, fl.saddr, fl.daddr, 0,
-			    ip4_dst_hoplimit(&rt->dst), 0, fl.fl4_sport,
+			    ip4_dst_hoplimit(&rt->dst), 0, src_port,
 			    fl.fl4_dport, false,
 			    !skb_is_gso(skb) && sk->sk_no_check_tx, 0);
 	ret = 0;
@@ -446,6 +480,7 @@ static int ovpn_udp6_output(struct ovpn_peer *peer, struct ovpn_bind *bind,
 			    struct sk_buff *skb)
 {
 	struct dst_entry *dst;
+	__be16 src_port;
 	int ret;
 
 	struct flowi6 fl = {
@@ -486,6 +521,7 @@ static int ovpn_udp6_output(struct ovpn_peer *peer, struct ovpn_bind *bind,
 	dst_cache_set_ip6(cache, dst, &fl.saddr);
 
 transmit:
+	src_port = ovpn_udp_src_port(peer, sk, skb);
 	/* user IPv6 packets may be larger than the transport interface
 	 * MTU (after encapsulation), however, since they are locally
 	 * generated we should ensure they get fragmented.
@@ -500,7 +536,7 @@ transmit:
 	 * the socket's no-check option has changed since batch creation
 	 */
 	udp_tunnel6_xmit_skb(dst, sk, skb, skb->dev, &fl.saddr, &fl.daddr, 0,
-			     ip6_dst_hoplimit(dst), 0, fl.fl6_sport,
+			     ip6_dst_hoplimit(dst), 0, src_port,
 			     fl.fl6_dport,
 			     !skb_is_gso(skb) && udp_get_no_check6_tx(sk), 0);
 	ret = 0;

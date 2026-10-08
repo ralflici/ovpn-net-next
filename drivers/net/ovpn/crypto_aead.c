@@ -493,6 +493,8 @@ retry:
 	}
 	if (unlikely(ret < 0))
 		return ret;
+	if (key->lane_bits)
+		ovpn_skb_cb(skb)->xmit_lane = ovpn_pktid_epoch_lane(seq);
 
 	/* check that there's enough headroom in the skb for packet
 	 * encapsulation

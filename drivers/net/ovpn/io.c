@@ -366,8 +366,12 @@ void ovpn_decrypt_post(void *data, int ret)
 
 	rcu_read_lock();
 	sock = rcu_dereference(peer->sock);
-	if (sock && sock->sk->sk_protocol == IPPROTO_UDP)
-		/* check if this peer changed local or remote endpoint */
+	if (sock && sock->sk->sk_protocol == IPPROTO_UDP &&
+	    (!key->lane_bits || !ovpn_pktid_epoch_lane(pktid)))
+		/* Only lane zero uses the canonical UDP source port. Other
+		 * lane ports provide RSS entropy and are not return endpoints,
+		 * so they must not make the peer float.
+		 */
 		ovpn_peer_endpoints_update(peer, skb);
 	rcu_read_unlock();
 
@@ -729,6 +733,9 @@ retry:
 	ovpn_skb_cb(batch)->peer = peer;
 	ovpn_skb_cb(batch)->ks = ks;
 	ovpn_skb_cb(batch)->key = key;
+	if (key->lane_bits)
+		ovpn_skb_cb(batch)->xmit_lane =
+			ovpn_pktid_epoch_lane(first_pktid);
 	atomic_set(&ovpn_skb_cb(batch)->batch_state.pending, segments);
 	atomic_set(&ovpn_skb_cb(batch)->batch_state.failed, 0);
 

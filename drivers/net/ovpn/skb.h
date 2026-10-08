@@ -26,6 +26,7 @@
  * @peer: peer used by this crypto operation or owned by this aggregate
  * @ks: crypto key slot used by this operation or owned by this aggregate
  * @key: key context used by this operation or owned by this aggregate
+ * @xmit_lane: packet-ID lane selected before transmit encryption
  * @payload_offset: offset in the skb where the payload starts
  * @nosignal: whether this skb should be sent with the MSG_NOSIGNAL flag (TCP)
  * @canonical: whether this skb must use the canonical transmit lane
@@ -37,6 +38,7 @@ struct ovpn_cb {
 	struct ovpn_peer *peer;
 	struct ovpn_crypto_key_slot *ks;
 	struct ovpn_key_ctx *key;
+	u16 xmit_lane;
 
 	/* Ordinary encryption leaves this union zeroed. Decryption and TCP use
 	 * their ordinary fields, a UDP GSO input stores its output aggregate,
