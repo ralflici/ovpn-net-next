@@ -17,6 +17,17 @@ OVPN_PROTO=${OVPN_PROTO:-UDP}
 OVPN_FLOAT=${OVPN_FLOAT:-0}
 OVPN_SYMMETRIC_ID=${OVPN_SYMMETRIC_ID:-0}
 OVPN_VERBOSE=${OVPN_VERBOSE:-0}
+OVPN_EPOCH_TX_LANE_BITS=${OVPN_EPOCH_TX_LANE_BITS:-0}
+OVPN_EPOCH_RX_LANE_BITS=${OVPN_EPOCH_RX_LANE_BITS:-0}
+OVPN_SPORT_ENTROPY_TX_MIN=${OVPN_SPORT_ENTROPY_TX_MIN:-0}
+OVPN_SPORT_ENTROPY_TX_MAX=${OVPN_SPORT_ENTROPY_TX_MAX:-0}
+
+OVPN_LANE_ARGS=()
+if (( OVPN_EPOCH_TX_LANE_BITS || OVPN_EPOCH_RX_LANE_BITS )); then
+	OVPN_LANE_ARGS=(entropy "${OVPN_EPOCH_TX_LANE_BITS}"
+		"${OVPN_EPOCH_RX_LANE_BITS}" "${OVPN_SPORT_ENTROPY_TX_MIN}"
+		"${OVPN_SPORT_ENTROPY_TX_MAX}")
+fi
 
 export OVPN_ID_OFFSET=$(( 9 * (OVPN_SYMMETRIC_ID == 0) ))
 
@@ -231,7 +242,7 @@ ovpn_add_peer() {
 		if [ ${1} -eq 0 ]; then
 			ip netns exec "${server_ns}" ${OVPN_CLI} \
 				new_multi_peer tun0 1 ${M_ID} \
-				${OVPN_UDP_PEERS_FILE}
+				${OVPN_UDP_PEERS_FILE} "${OVPN_LANE_ARGS[@]}"
 
 			for p in $(seq 1 ${OVPN_NUM_PEERS}); do
 				ip netns exec "${server_ns}" ${OVPN_CLI} \
@@ -256,7 +267,7 @@ ovpn_add_peer() {
 				${OVPN_UDP_PEERS_FILE})
 			ip netns exec "${peer_ns}" ${OVPN_CLI} new_peer \
 				tun${1} ${PEER_ID} ${TX_ID} ${LPORT} ${RADDR} \
-				${RPORT}
+				${RPORT} "${OVPN_LANE_ARGS[@]}"
 			ip netns exec "${peer_ns}" ${OVPN_CLI} new_key tun${1} \
 				${PEER_ID} 1 0 ${OVPN_ALG} ${OVPN_KEY_TYPE} \
 				1 data64.key

@@ -111,6 +111,10 @@ struct ovpn_ctx {
 
 	unsigned long peer_id, tx_id;
 	unsigned long lport;
+	__u8 epoch_tx_lane_bits;
+	__u8 epoch_rx_lane_bits;
+	__u16 sport_entropy_tx_min;
+	__u16 sport_entropy_tx_max;
 
 	union {
 		struct sockaddr_in in4;
@@ -683,6 +687,17 @@ static int ovpn_new_peer(struct ovpn_ctx *ovpn, bool is_tcp)
 	if (ovpn->asymm_id)
 		NLA_PUT_U32(ctx->nl_msg, OVPN_A_PEER_TX_ID, ovpn->tx_id);
 	NLA_PUT_U32(ctx->nl_msg, OVPN_A_PEER_SOCKET, ovpn->socket);
+	if (ovpn->epoch_tx_lane_bits) {
+		NLA_PUT_U8(ctx->nl_msg, OVPN_A_PEER_EPOCH_TX_LANE_BITS,
+			   ovpn->epoch_tx_lane_bits);
+		NLA_PUT_U16(ctx->nl_msg, OVPN_A_PEER_SPORT_ENTROPY_TX_MIN,
+			    ovpn->sport_entropy_tx_min);
+		NLA_PUT_U16(ctx->nl_msg, OVPN_A_PEER_SPORT_ENTROPY_TX_MAX,
+			    ovpn->sport_entropy_tx_max);
+	}
+	if (ovpn->epoch_rx_lane_bits)
+		NLA_PUT_U8(ctx->nl_msg, OVPN_A_PEER_EPOCH_RX_LANE_BITS,
+			   ovpn->epoch_rx_lane_bits);
 
 	if (!is_tcp) {
 		switch (ovpn->remote.in4.sin_family) {
@@ -803,6 +818,20 @@ static int ovpn_handle_peer(struct nl_msg *msg, void (*arg)__always_unused)
 	if (pattrs[OVPN_A_PEER_TX_ID])
 		fprintf(stderr, "\tTX peer ID %u\n",
 			nla_get_u32(pattrs[OVPN_A_PEER_TX_ID]));
+
+	if (pattrs[OVPN_A_PEER_EPOCH_TX_LANE_BITS])
+		fprintf(stderr, "\tTX epoch lane bits: %u\n",
+			nla_get_u8(pattrs[OVPN_A_PEER_EPOCH_TX_LANE_BITS]));
+
+	if (pattrs[OVPN_A_PEER_EPOCH_RX_LANE_BITS])
+		fprintf(stderr, "\tRX epoch lane bits: %u\n",
+			nla_get_u8(pattrs[OVPN_A_PEER_EPOCH_RX_LANE_BITS]));
+
+	if (pattrs[OVPN_A_PEER_SPORT_ENTROPY_TX_MIN] &&
+	    pattrs[OVPN_A_PEER_SPORT_ENTROPY_TX_MAX])
+		fprintf(stderr, "\tTX entropy source ports: %u-%u\n",
+			nla_get_u16(pattrs[OVPN_A_PEER_SPORT_ENTROPY_TX_MIN]),
+			nla_get_u16(pattrs[OVPN_A_PEER_SPORT_ENTROPY_TX_MAX]));
 
 	if (pattrs[OVPN_A_PEER_SOCKET_NETNSID])
 		fprintf(stderr, "\tsocket NetNS ID: %d\n",
@@ -1772,7 +1801,7 @@ static void usage(const char *cmd)
 	fprintf(stderr, "\tkey_file: file containing the pre-shared key\n");
 
 	fprintf(stderr,
-		"* new_peer <iface> <peer_id> <tx_id> <lport> <raddr> <rport> [vpnaddr]: add new peer\n");
+		"* new_peer <iface> <peer_id> <tx_id> <lport> <raddr> <rport> [vpnaddr] [entropy <tx_bits> <rx_bits> <min_port> <max_port>]: add new peer\n");
 	fprintf(stderr, "\tiface: ovpn interface name\n");
 	fprintf(stderr,
 		"\tpeer_id: peer ID found in data packets received from this peer\n");
@@ -1782,9 +1811,11 @@ static void usage(const char *cmd)
 	fprintf(stderr, "\traddr: peer IP address\n");
 	fprintf(stderr, "\trport: peer UDP port\n");
 	fprintf(stderr, "\tvpnaddr: peer VPN IP\n");
+	fprintf(stderr,
+		"\tentropy: configure epoch lane bits and the TX source-port range\n");
 
 	fprintf(stderr,
-		"* new_multi_peer <iface> <lport> <id_type> <peers_file> [mark]: add multiple peers as listed in the file\n");
+		"* new_multi_peer <iface> <lport> <id_type> <peers_file> [mark] [entropy <tx_bits> <rx_bits> <min_port> <max_port>]: add multiple peers as listed in the file\n");
 	fprintf(stderr, "\tiface: ovpn interface name\n");
 	fprintf(stderr, "\tlport: local UDP port to bind to\n");
 	fprintf(stderr, "\tid_type:\n");
@@ -1797,6 +1828,8 @@ static void usage(const char *cmd)
 	fprintf(stderr,
 		"\t\t<peer_id> <tx_id> <raddr> <rport> <laddr> <lport> <vpnaddr>\n");
 	fprintf(stderr, "\tmark: socket FW mark value\n");
+	fprintf(stderr,
+		"\tentropy: configure epoch lane bits and the TX source-port range\n");
 
 	fprintf(stderr,
 		"* set_peer <iface> <peer_id> <keepalive_interval> <keepalive_timeout>: set peer attributes\n");
@@ -1930,6 +1963,60 @@ static int ovpn_parse_new_peer(struct ovpn_ctx *ovpn, const char *peer_id,
 	}
 
 	return ovpn_parse_remote(ovpn, raddr, rport, vpnip);
+}
+
+static int ovpn_parse_uint(const char *arg, unsigned long max,
+			   const char *name, unsigned long *value)
+{
+	char *end;
+
+	errno = 0;
+	*value = strtoul(arg, &end, 10);
+	if (errno == ERANGE || *end || *value > max) {
+		fprintf(stderr, "%s value out of range\n", name);
+		return -EINVAL;
+	}
+
+	return 0;
+}
+
+static int ovpn_parse_entropy(struct ovpn_ctx *ovpn, int argc, char *argv[])
+{
+	unsigned long tx_bits, rx_bits, min_port, max_port;
+	int ret;
+
+	if (argc != 5 || strcmp(argv[0], "entropy"))
+		return -EINVAL;
+
+	ret = ovpn_parse_uint(argv[1], 12, "TX lane bits", &tx_bits);
+	if (ret)
+		return ret;
+	ret = ovpn_parse_uint(argv[2], 12, "RX lane bits", &rx_bits);
+	if (ret)
+		return ret;
+	ret = ovpn_parse_uint(argv[3], UINT16_MAX, "minimum source port",
+			      &min_port);
+	if (ret)
+		return ret;
+	ret = ovpn_parse_uint(argv[4], UINT16_MAX, "maximum source port",
+			      &max_port);
+	if (ret)
+		return ret;
+
+	if ((!tx_bits && (min_port || max_port)) ||
+	    (tx_bits && ((!min_port != !max_port) ||
+			 (min_port && min_port > max_port))) ||
+	    (!tx_bits && !rx_bits)) {
+		fprintf(stderr, "invalid epoch lane configuration\n");
+		return -EINVAL;
+	}
+
+	ovpn->epoch_tx_lane_bits = tx_bits;
+	ovpn->epoch_rx_lane_bits = rx_bits;
+	ovpn->sport_entropy_tx_min = min_port;
+	ovpn->sport_entropy_tx_max = max_port;
+
+	return 0;
 }
 
 static int ovpn_parse_key_slot(const char *arg, struct ovpn_ctx *ovpn)
@@ -2182,6 +2269,12 @@ static int ovpn_run_cmd(struct ovpn_ctx *ovpn)
 			peer_ctx.socket = ovpn->socket;
 			peer_ctx.sa_family = AF_UNSPEC;
 			peer_ctx.asymm_id = ovpn->asymm_id;
+			peer_ctx.epoch_tx_lane_bits = ovpn->epoch_tx_lane_bits;
+			peer_ctx.epoch_rx_lane_bits = ovpn->epoch_rx_lane_bits;
+			peer_ctx.sport_entropy_tx_min =
+				ovpn->sport_entropy_tx_min;
+			peer_ctx.sport_entropy_tx_max =
+				ovpn->sport_entropy_tx_max;
 
 			ret = ovpn_parse_new_peer(&peer_ctx, peer_id, tx_id,
 						  raddr, rport, vpnip);
@@ -2337,6 +2430,10 @@ static int ovpn_parse_cmd_args(struct ovpn_ctx *ovpn, int argc, char *argv[])
 		}
 		break;
 	case CMD_NEW_PEER:
+	{
+		const char *vpnip = NULL;
+		int arg = 8;
+
 		if (argc < 8)
 			return -EINVAL;
 
@@ -2348,14 +2445,22 @@ static int ovpn_parse_cmd_args(struct ovpn_ctx *ovpn, int argc, char *argv[])
 			return -1;
 		}
 
-		const char *vpnip = (argc > 8) ? argv[8] : NULL;
+		if (argc > arg && strcmp(argv[arg], "entropy"))
+			vpnip = argv[arg++];
 
 		ret = ovpn_parse_new_peer(ovpn, argv[3], argv[4], argv[6],
 					  argv[7], vpnip);
 		if (ret < 0)
 			return -1;
+
+		if (argc > arg)
+			return ovpn_parse_entropy(ovpn, argc - arg, &argv[arg]);
 		break;
+	}
 	case CMD_NEW_MULTI_PEER:
+	{
+		int arg = 6;
+
 		if (argc < 6)
 			return -EINVAL;
 
@@ -2377,14 +2482,18 @@ static int ovpn_parse_cmd_args(struct ovpn_ctx *ovpn, int argc, char *argv[])
 		ovpn->peers_file = argv[5];
 
 		ovpn->mark = 0;
-		if (argc > 6) {
-			ovpn->mark = strtoul(argv[6], NULL, 10);
+		if (argc > arg && strcmp(argv[arg], "entropy")) {
+			ovpn->mark = strtoul(argv[arg++], NULL, 10);
 			if (errno == ERANGE || ovpn->mark > UINT32_MAX) {
 				fprintf(stderr, "mark value out of range\n");
 				return -1;
 			}
 		}
+
+		if (argc > arg)
+			return ovpn_parse_entropy(ovpn, argc - arg, &argv[arg]);
 		break;
+	}
 	case CMD_SET_PEER:
 		if (argc < 6)
 			return -EINVAL;
