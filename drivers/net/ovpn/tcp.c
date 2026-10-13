@@ -117,10 +117,11 @@ static void ovpn_tcp_rcv(struct strparser *strp, struct sk_buff *skb)
 	if (skb_copy_bits(skb, msg->offset, &hdr, sizeof(hdr)))
 		goto err;
 
-	/* extract the packet into a new skb */
-	skb = ovpn_tcp_skb_packet(peer, skb, pkt_len, msg->offset + sizeof(hdr));
+	/* Keep the prefix in headroom for DATA_V2 authentication. */
+	skb = ovpn_tcp_skb_packet(peer, skb, msg->full_len, msg->offset);
 	if (unlikely(!skb))
 		goto err;
+	__skb_pull(skb, sizeof(hdr));
 
 	/* DATA_V2 packets are handled in kernel, the rest goes to user space */
 	opcode = ovpn_opcode_from_skb(skb, 0);
@@ -150,7 +151,7 @@ static void ovpn_tcp_rcv(struct strparser *strp, struct sk_buff *skb)
 	if (WARN_ON(!ovpn_peer_hold(peer)))
 		goto err_nopeer;
 
-	ovpn_recv(peer, skb);
+	ovpn_recv(peer, skb, true);
 	return;
 err:
 	/* take reference for deferred peer deletion. should never fail */

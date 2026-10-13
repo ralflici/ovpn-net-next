@@ -13,7 +13,10 @@
 #include <net/gro_cells.h>
 #include <net/gso.h>
 #include <net/ip.h>
+#include <net/ip6_checksum.h>
+#include <net/ipv6.h>
 #include <net/sock.h>
+#include <net/tcp.h>
 #include <net/udp.h>
 
 #include "ovpnpriv.h"
@@ -62,24 +65,75 @@ static bool ovpn_is_keepalive(struct sk_buff *skb)
 	return !memcmp(skb->data, ovpn_keepalive_message, OVPN_KEEPALIVE_SIZE);
 }
 
+/* Reconstruct inner offload state only from authenticated, bounded headers.
+ * The segment size comes from the wire; derive the count from the payload.
+ */
+static int ovpn_tcp_gso_restore(struct sk_buff *skb, u16 gso_size)
+{
+	unsigned int thoff = 0, hdr_len, payload_len, gso_type;
+	struct tcphdr *th;
+
+	if (skb->protocol == htons(ETH_P_IP)) {
+		const struct iphdr *iph = ip_hdr(skb);
+
+		thoff = iph->ihl * 4;
+		if (thoff < sizeof(*iph) || iph->protocol != IPPROTO_TCP ||
+		    ip_is_fragment(iph) || ntohs(iph->tot_len) != skb->len)
+			return -EINVAL;
+		gso_type = SKB_GSO_TCPV4;
+	} else {
+		const struct ipv6hdr *iph = ipv6_hdr(skb);
+		int flags = IP6_FH_F_AUTH;
+
+		if (ntohs(iph->payload_len) + sizeof(*iph) != skb->len ||
+		    ipv6_find_hdr(skb, &thoff, -1, NULL, &flags) != IPPROTO_TCP ||
+		    (flags & IP6_FH_F_FRAG))
+			return -EINVAL;
+		gso_type = SKB_GSO_TCPV6;
+	}
+
+	if (!pskb_may_pull(skb, thoff + sizeof(*th)))
+		return -EINVAL;
+	skb_set_transport_header(skb, thoff);
+	th = tcp_hdr(skb);
+	if (th->doff < sizeof(*th) / 4 || th->syn || th->rst || th->urg)
+		return -EINVAL;
+	hdr_len = thoff + th->doff * 4;
+	if (!pskb_may_pull(skb, hdr_len) || skb->len <= hdr_len)
+		return -EINVAL;
+
+	/* Match TCP GRO completion: restore the pseudo-header checksum seed
+	 * and let the stack complete per-segment checksums when needed.
+	 */
+	th = tcp_hdr(skb);
+	if (skb->protocol == htons(ETH_P_IP))
+		th->check = ~tcp_v4_check(skb->len - thoff, ip_hdr(skb)->saddr,
+					  ip_hdr(skb)->daddr, 0);
+	else
+		th->check = ~tcp_v6_check(skb->len - thoff, &ipv6_hdr(skb)->saddr,
+					  &ipv6_hdr(skb)->daddr, 0);
+	skb->csum_start = skb_headroom(skb) + thoff;
+	skb->csum_offset = offsetof(struct tcphdr, check);
+	skb->ip_summed = CHECKSUM_PARTIAL;
+
+	/* A short, single-segment input only needs checksum completion. */
+	payload_len = skb->len - hdr_len;
+	if (payload_len > gso_size) {
+		skb_shinfo(skb)->gso_type = gso_type | SKB_GSO_DODGY;
+		skb_shinfo(skb)->gso_size = gso_size;
+		skb_shinfo(skb)->gso_segs = DIV_ROUND_UP(payload_len, gso_size);
+	}
+
+	return 0;
+}
+
 /* Called after decrypt to write the IP packet to the device.
  * This method is expected to manage/free the skb.
  */
 static void ovpn_netdev_write(struct ovpn_peer *peer, struct sk_buff *skb)
 {
-	unsigned int pkt_len;
+	unsigned int pkt_len, packets = 1;
 	int ret;
-
-	/* the transport encapsulation and its GSO metadata do not describe the
-	 * decrypted inner packet
-	 */
-	skb->encapsulation = 0;
-	skb_gso_reset(skb);
-
-	/* we can't guarantee the packet wasn't corrupted before entering the
-	 * VPN, therefore we give other layers a chance to check that
-	 */
-	skb->ip_summed = CHECKSUM_NONE;
 
 	/* skb hash for transport packet no longer valid after decapsulation */
 	skb_clear_hash(skb);
@@ -93,11 +147,14 @@ static void ovpn_netdev_write(struct ovpn_peer *peer, struct sk_buff *skb)
 
 	/* network header reset in ovpn_decrypt_post() */
 	skb_reset_mac_header(skb);
-	skb_reset_transport_header(skb);
 	skb_reset_inner_headers(skb);
 
 	/* cause packet to be "received" by the interface */
 	pkt_len = skb->len;
+	if (skb_is_gso(skb)) {
+		packets = skb_shinfo(skb)->gso_segs;
+		pkt_len += (packets - 1) * skb_tcp_all_headers(skb);
+	}
 	/* we may get here in process context in case of TCP connections,
 	 * therefore we have to disable BHs to ensure gro_cells_receive()
 	 * and dev_dstats_rx_add() do not get corrupted or enter deadlock
@@ -106,8 +163,8 @@ static void ovpn_netdev_write(struct ovpn_peer *peer, struct sk_buff *skb)
 	ret = gro_cells_receive(&peer->ovpn->gro_cells, skb);
 	if (likely(ret == NET_RX_SUCCESS)) {
 		/* update RX stats with the size of decrypted packet */
-		ovpn_peer_stats_increment_rx(&peer->vpn_stats, pkt_len);
-		dev_dstats_rx_add(peer->ovpn->dev, pkt_len);
+		ovpn_peer_stats_add_rx(&peer->vpn_stats, pkt_len, packets);
+		ovpn_dev_dstats_rx_add(peer->ovpn->dev, pkt_len, packets);
 	}
 	local_bh_enable();
 }
@@ -119,6 +176,7 @@ void ovpn_decrypt_post(void *data, int ret)
 	struct sk_buff *skb = data;
 	struct ovpn_socket *sock;
 	struct ovpn_peer *peer;
+	u16 gso_size;
 	__be16 proto;
 	__be32 *pid;
 
@@ -129,6 +187,7 @@ void ovpn_decrypt_post(void *data, int ret)
 		return;
 
 	payload_offset = ovpn_skb_cb(skb)->payload_offset;
+	gso_size = ovpn_skb_cb(skb)->gso_size;
 	ks = ovpn_skb_cb(skb)->ks;
 	peer = ovpn_skb_cb(skb)->peer;
 
@@ -161,6 +220,15 @@ void ovpn_decrypt_post(void *data, int ret)
 	/* point to encapsulated IP packet */
 	__skb_pull(skb, payload_offset);
 
+	/* Discard outer offload state before reconstructing the inner packet.
+	 * Ordinary packets still get their checksums checked by the stack.
+	 */
+	skb->encapsulation = 0;
+	skb_gso_reset(skb);
+	skb->ip_summed = CHECKSUM_NONE;
+	skb->csum_level = 0;
+	skb_reset_transport_header(skb);
+
 	/* check if this is a valid datapacket that has to be delivered to the
 	 * ovpn interface
 	 */
@@ -175,7 +243,7 @@ void ovpn_decrypt_post(void *data, int ret)
 			goto drop;
 		}
 
-		if (ovpn_is_keepalive(skb)) {
+		if (!gso_size && ovpn_is_keepalive(skb)) {
 			net_dbg_ratelimited("%s: ping received from peer %u\n",
 					    netdev_name(peer->ovpn->dev),
 					    peer->id);
@@ -189,6 +257,8 @@ void ovpn_decrypt_post(void *data, int ret)
 		goto drop;
 	}
 	skb->protocol = proto;
+	if (gso_size && ovpn_tcp_gso_restore(skb, gso_size))
+		goto drop;
 
 	/* perform Reverse Path Filtering (RPF) */
 	if (unlikely(!ovpn_peer_check_by_src(peer->ovpn, skb, peer))) {
@@ -218,7 +288,7 @@ drop_nocount:
 }
 
 /* RX path entry point: decrypt packet and forward it to the device */
-void ovpn_recv(struct ovpn_peer *peer, struct sk_buff *skb)
+void ovpn_recv(struct ovpn_peer *peer, struct sk_buff *skb, bool tcp)
 {
 	struct ovpn_crypto_key_slot *ks;
 	u8 key_id;
@@ -239,7 +309,7 @@ void ovpn_recv(struct ovpn_peer *peer, struct sk_buff *skb)
 	}
 
 	memset(ovpn_skb_cb(skb), 0, sizeof(struct ovpn_cb));
-	ovpn_decrypt_post(skb, ovpn_aead_decrypt(peer, ks, skb));
+	ovpn_decrypt_post(skb, ovpn_aead_decrypt(peer, ks, skb, tcp));
 }
 
 static void ovpn_encrypt_key_exhausted(struct ovpn_peer *peer,

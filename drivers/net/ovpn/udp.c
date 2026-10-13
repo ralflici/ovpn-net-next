@@ -247,7 +247,7 @@ static void ovpn_udp_recv(struct ovpn_peer *peer, struct sk_buff *skb)
 			next = NULL;
 		}
 
-		ovpn_recv(peer, skb);
+		ovpn_recv(peer, skb, false);
 	}
 }
 
