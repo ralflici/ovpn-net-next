@@ -63,6 +63,20 @@ static inline void ovpn_dev_dstats_tx_dropped(struct net_device *dev,
 	local_bh_enable();
 }
 
+static inline void ovpn_dev_dstats_tx_add(struct net_device *dev,
+					  unsigned int bytes, unsigned int packets)
+{
+	struct pcpu_dstats *dstats;
+
+	local_bh_disable();
+	dstats = this_cpu_ptr(dev->dstats);
+	u64_stats_update_begin(&dstats->syncp);
+	u64_stats_add(&dstats->tx_packets, packets);
+	u64_stats_add(&dstats->tx_bytes, bytes);
+	u64_stats_update_end(&dstats->syncp);
+	local_bh_enable();
+}
+
 static inline void ovpn_dev_dstats_rx_dropped(struct net_device *dev)
 {
 	local_bh_disable();

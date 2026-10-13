@@ -40,10 +40,8 @@ static int ovpn_tcp_parse(struct strparser *strp, struct sk_buff *skb)
 	u16 len;
 	int err;
 
-	/* when packets are written to the TCP stream, they are prepended with
-	 * two bytes indicating the actual packet size.
-	 * Parse accordingly and return the actual size (including the size
-	 * header)
+	/* The length counts everything after itself, including gso_size.
+	 * Framing therefore still needs only the initial two bytes.
 	 */
 
 	if (skb->len < rxm->offset + 2)
@@ -54,7 +52,7 @@ static int ovpn_tcp_parse(struct strparser *strp, struct sk_buff *skb)
 		return err;
 
 	len = be16_to_cpu(blen);
-	if (len < 2)
+	if (len < sizeof_field(struct ovpn_tcp_hdr, gso_size) + OVPN_OPCODE_SIZE)
 		return -EINVAL;
 
 	return len + 2;
@@ -103,7 +101,8 @@ static void ovpn_tcp_rcv(struct strparser *strp, struct sk_buff *skb)
 {
 	struct ovpn_peer *peer = container_of(strp, struct ovpn_peer, tcp.strp);
 	struct strp_msg *msg = strp_msg(skb);
-	int pkt_len = msg->full_len - 2;
+	struct ovpn_tcp_hdr hdr;
+	int pkt_len = msg->full_len - sizeof(hdr);
 	u8 opcode;
 
 	/* we need at least 4 bytes of data in the packet
@@ -115,22 +114,28 @@ static void ovpn_tcp_rcv(struct strparser *strp, struct sk_buff *skb)
 		goto err;
 	}
 
+	if (skb_copy_bits(skb, msg->offset, &hdr, sizeof(hdr)))
+		goto err;
+
 	/* extract the packet into a new skb */
-	skb = ovpn_tcp_skb_packet(peer, skb, pkt_len, msg->offset + 2);
+	skb = ovpn_tcp_skb_packet(peer, skb, pkt_len, msg->offset + sizeof(hdr));
 	if (unlikely(!skb))
 		goto err;
 
 	/* DATA_V2 packets are handled in kernel, the rest goes to user space */
 	opcode = ovpn_opcode_from_skb(skb, 0);
 	if (unlikely(opcode != OVPN_DATA_V2)) {
+		if (hdr.gso_size)
+			goto err;
+
 		if (opcode == OVPN_DATA_V1) {
 			net_warn_ratelimited("%s: DATA_V1 detected on the TCP stream\n",
 					     netdev_name(peer->ovpn->dev));
 			goto err;
 		}
 
-		/* The packet size header must be there when sending the packet
-		 * to userspace, therefore we put it back
+		/* Preserve userspace's two-byte control-record prefix. pkt_len
+		 * excludes the GSO field that was present on the wire.
 		 */
 		*(__be16 *)__skb_push(skb, sizeof(u16)) = htons(pkt_len);
 		ovpn_tcp_to_userspace(peer, strp->sk, skb);
@@ -299,9 +304,8 @@ static void ovpn_tcp_send_sock(struct ovpn_peer *peer, struct sock *sk)
 	} while (peer->tcp.out_msg.len > 0);
 
 	if (!peer->tcp.out_msg.len) {
-		local_bh_disable();
-		dev_dstats_tx_add(peer->ovpn->dev, skb->len);
-		local_bh_enable();
+		ovpn_dev_dstats_tx_add(peer->ovpn->dev, skb->len,
+				       ovpn_skb_cb(skb)->tcp_packets);
 	}
 
 	kfree_skb(peer->tcp.out_msg.skb);
@@ -332,7 +336,8 @@ static void ovpn_tcp_send_sock_skb(struct ovpn_peer *peer, struct sock *sk,
 		ovpn_tcp_send_sock(peer, sk);
 
 	if (peer->tcp.out_msg.skb) {
-		ovpn_dev_dstats_tx_dropped(peer->ovpn->dev, 1);
+		ovpn_dev_dstats_tx_dropped(peer->ovpn->dev,
+					   ovpn_skb_cb(skb)->tcp_packets);
 		kfree_skb(skb);
 		return;
 	}
@@ -346,15 +351,17 @@ static void ovpn_tcp_send_sock_skb(struct ovpn_peer *peer, struct sock *sk,
 void ovpn_tcp_send_skb(struct ovpn_peer *peer, struct sock *sk,
 		       struct sk_buff *skb)
 {
-	u16 len = skb->len;
-
-	*(__be16 *)__skb_push(skb, sizeof(u16)) = htons(len);
+	/* Length and GSO size were prepared in headroom and authenticated by
+	 * crypto. Expose the prefix without rewriting it after encryption.
+	 */
+	__skb_push(skb, sizeof(struct ovpn_tcp_hdr));
 
 	spin_lock_nested(&sk->sk_lock.slock, OVPN_TCP_DEPTH_NESTING);
 	if (sock_owned_by_user(sk)) {
 		if (skb_queue_len(&peer->tcp.out_queue) >=
 		    READ_ONCE(net_hotdata.max_backlog)) {
-			ovpn_dev_dstats_tx_dropped(peer->ovpn->dev, 1);
+			ovpn_dev_dstats_tx_dropped(peer->ovpn->dev,
+						   ovpn_skb_cb(skb)->tcp_packets);
 			kfree_skb(skb);
 			goto unlock;
 		}
@@ -405,8 +412,11 @@ static int ovpn_tcp_sendmsg(struct sock *sk, struct msghdr *msg, size_t size)
 {
 	struct ovpn_socket *sock;
 	int ret, linear = PAGE_SIZE;
+	struct ovpn_tcp_hdr *hdr;
 	struct ovpn_peer *peer;
 	struct sk_buff *skb;
+	size_t wire_size;
+	__be16 len;
 
 	lock_sock(sk);
 	rcu_read_lock();
@@ -429,10 +439,28 @@ static int ovpn_tcp_sendmsg(struct sock *sk, struct msghdr *msg, size_t size)
 		goto peer_free;
 	}
 
-	if (size < linear)
-		linear = size;
+	/* Prototype userspace ABI: one complete, conventionally framed control
+	 * record per write, as supplied by ovpn-cli. Streamed writes can follow
+	 * once negotiation and the userspace interface are implemented.
+	 */
+	if (size < sizeof(len) + OVPN_OPCODE_SIZE || size > U16_MAX) {
+		ret = -EMSGSIZE;
+		goto peer_free;
+	}
+	if (!copy_from_iter_full(&len, sizeof(len), &msg->msg_iter)) {
+		ret = -EFAULT;
+		goto peer_free;
+	}
+	if (ntohs(len) != size - sizeof(len)) {
+		ret = -EINVAL;
+		goto peer_free;
+	}
 
-	skb = sock_alloc_send_pskb(sk, linear, size - linear,
+	wire_size = size + sizeof(hdr->gso_size);
+	if (wire_size < linear)
+		linear = wire_size;
+
+	skb = sock_alloc_send_pskb(sk, linear, wire_size - linear,
 				   msg->msg_flags & MSG_DONTWAIT, &ret, 0);
 	if (!skb) {
 		net_err_ratelimited("%s: skb alloc failed: %d\n",
@@ -441,10 +469,14 @@ static int ovpn_tcp_sendmsg(struct sock *sk, struct msghdr *msg, size_t size)
 	}
 
 	skb_put(skb, linear);
-	skb->len = size;
-	skb->data_len = size - linear;
+	skb->len = wire_size;
+	skb->data_len = wire_size - linear;
 
-	ret = skb_copy_datagram_from_iter(skb, 0, &msg->msg_iter, size);
+	hdr = (struct ovpn_tcp_hdr *)skb->data;
+	hdr->len = htons(size);
+	hdr->gso_size = 0;
+	ret = skb_copy_datagram_from_iter(skb, sizeof(*hdr), &msg->msg_iter,
+					  size - sizeof(len));
 	if (ret) {
 		kfree_skb(skb);
 		net_err_ratelimited("%s: skb copy from iter failed: %d\n",
@@ -452,7 +484,9 @@ static int ovpn_tcp_sendmsg(struct sock *sk, struct msghdr *msg, size_t size)
 		goto peer_free;
 	}
 
+	memset(ovpn_skb_cb(skb), 0, sizeof(struct ovpn_cb));
 	ovpn_skb_cb(skb)->nosignal = msg->msg_flags & MSG_NOSIGNAL;
+	ovpn_skb_cb(skb)->tcp_packets = 1;
 	ovpn_tcp_send_sock_skb(peer, sk, skb);
 	ret = size;
 peer_free:

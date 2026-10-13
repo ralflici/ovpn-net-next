@@ -274,6 +274,7 @@ void ovpn_encrypt_post(void *data, int ret)
 	batch = ovpn_skb_cb(skb)->batch;
 	peer = ovpn_skb_cb(skb)->peer;
 	ks = ovpn_skb_cb(skb)->ks;
+	packets = ovpn_skb_cb(skb)->tcp_packets ?: 1;
 
 	/* crypto is done, cleanup skb CB and its members */
 	kfree(ovpn_skb_cb(skb)->crypto_tmp);
@@ -349,12 +350,29 @@ err:
 		ovpn_peer_put(peer);
 }
 
-/* Hold the peer and its primary key for one encryption submission.
- * The returned key and the peer each carry one reference which completion must
- * release.
+/* One request owns the input and output, with no UDP batch completion state.
+ * The output owns the peer/key references used by the ordinary send path.
+ */
+void ovpn_encrypt_tcp_gso_post(void *data, int ret)
+{
+	struct sk_buff *skb = data;
+	struct sk_buff *gso_skb;
+
+	if (unlikely(ret == -EINPROGRESS))
+		return;
+
+	gso_skb = ovpn_skb_cb(skb)->tcp_gso;
+	kfree(ovpn_skb_cb(skb)->crypto_tmp);
+	consume_skb(skb);
+	ovpn_encrypt_post(gso_skb, ret);
+}
+
+/* Prepare the output control block and hold its peer and primary key.
+ * Completion releases both references, once per ordinary packet or aggregate.
  */
 static struct ovpn_crypto_key_slot *
-ovpn_encrypt_refs_get(struct ovpn_peer *peer)
+ovpn_encrypt_prepare(struct ovpn_peer *peer, struct sk_buff *skb,
+		     unsigned int tcp_packets)
 {
 	struct ovpn_crypto_key_slot *ks;
 
@@ -372,18 +390,35 @@ ovpn_encrypt_refs_get(struct ovpn_peer *peer)
 		return NULL;
 	}
 
+	memset(ovpn_skb_cb(skb), 0, sizeof(struct ovpn_cb));
+	ovpn_skb_cb(skb)->peer = peer;
+	ovpn_skb_cb(skb)->ks = ks;
+	ovpn_skb_cb(skb)->tcp_packets = tcp_packets;
+
 	return ks;
+}
+
+static bool ovpn_peer_uses_tcp(struct ovpn_peer *peer)
+{
+	struct ovpn_socket *sock;
+	bool tcp;
+
+	rcu_read_lock();
+	sock = rcu_dereference(peer->sock);
+	tcp = sock && sock->sk->sk_protocol == IPPROTO_TCP;
+	rcu_read_unlock();
+
+	return tcp;
 }
 
 static bool ovpn_encrypt_one(struct ovpn_peer *peer, struct sk_buff *skb)
 {
 	struct ovpn_crypto_key_slot *ks;
 
-	ks = ovpn_encrypt_refs_get(peer);
+	ks = ovpn_encrypt_prepare(peer, skb, ovpn_peer_uses_tcp(peer));
 	if (unlikely(!ks))
 		return false;
 
-	memset(ovpn_skb_cb(skb), 0, sizeof(struct ovpn_cb));
 	ovpn_encrypt_post(skb, ovpn_aead_encrypt(peer, ks, skb));
 	return true;
 }
@@ -410,20 +445,21 @@ static void ovpn_skb_prefetch_frag(const struct sk_buff *skb)
 		prefetch((void *)addr);
 }
 
-static bool ovpn_encrypt_gso_queue(struct sk_buff_head *skbs,
-				   struct ovpn_peer *peer,
-				   struct sk_buff *batch,
-				   unsigned int segments)
+static bool ovpn_encrypt_udp_gso_queue(struct sk_buff_head *skbs,
+				       struct ovpn_peer *peer,
+				       struct sk_buff *batch,
+				       unsigned int segments)
 {
 	unsigned int offset = 0, i, len;
 	struct ovpn_crypto_key_slot *ks;
 	struct sk_buff *skb;
 	u32 first_pktid;
+	int ret;
 
 	/* acquire all shared state before removing the first input skb so that
 	 * failure can leave the queue intact for the ordinary transmit path
 	 */
-	ks = ovpn_encrypt_refs_get(peer);
+	ks = ovpn_encrypt_prepare(peer, batch, 0);
 	if (unlikely(!ks))
 		return false;
 
@@ -438,12 +474,6 @@ static bool ovpn_encrypt_gso_queue(struct sk_buff_head *skbs,
 		return false;
 	}
 
-	/* the aggregate owns these references until every sync or async crypto
-	 * completion has finished
-	 */
-	memset(ovpn_skb_cb(batch), 0, sizeof(struct ovpn_cb));
-	ovpn_skb_cb(batch)->peer = peer;
-	ovpn_skb_cb(batch)->ks = ks;
 	atomic_set(&ovpn_skb_cb(batch)->batch_state.pending, segments);
 	atomic_set(&ovpn_skb_cb(batch)->batch_state.failed, 0);
 
@@ -459,13 +489,40 @@ static bool ovpn_encrypt_gso_queue(struct sk_buff_head *skbs,
 
 		memset(ovpn_skb_cb(skb), 0, sizeof(struct ovpn_cb));
 		ovpn_skb_cb(skb)->batch = batch;
-		ovpn_encrypt_post(skb, ovpn_aead_encrypt_gso(peer, ks, skb,
-							     batch, offset,
-							     first_pktid + i));
+		ret = ovpn_aead_encrypt_udp_gso(peer, ks, skb, batch, offset,
+						first_pktid + i);
+		ovpn_encrypt_post(skb, ret);
 		offset += len;
 	}
 
 	return true;
+}
+
+static struct sk_buff *ovpn_gso_alloc(const struct sk_buff *skb,
+				      unsigned int head_len,
+				      unsigned int data_len)
+{
+	struct sk_buff *gso_skb;
+	int ret;
+
+	gso_skb = alloc_skb_with_frags(OVPN_HEAD_ROOM + head_len, data_len,
+				       SKB_FRAG_PAGE_ORDER, &ret, GFP_ATOMIC);
+	if (unlikely(!gso_skb))
+		return NULL;
+
+	skb_reserve(gso_skb, OVPN_HEAD_ROOM);
+	skb_put(gso_skb, head_len);
+	gso_skb->len += data_len;
+	gso_skb->data_len = data_len;
+	gso_skb->priority = skb->priority;
+
+	/* Keep the originating socket's send-buffer accounting active until
+	 * the output is transmitted. This also preserves its cached TX queue.
+	 */
+	if (skb->sk && is_skb_wmem(skb))
+		skb_set_owner_w(gso_skb, skb->sk);
+
+	return gso_skb;
 }
 
 static struct sk_buff *ovpn_udp_gso_alloc(const struct sk_buff *first_segment,
@@ -473,24 +530,11 @@ static struct sk_buff *ovpn_udp_gso_alloc(const struct sk_buff *first_segment,
 					  unsigned int segments)
 {
 	struct sk_buff *gso_skb;
-	int ret;
 
-	gso_skb = alloc_skb_with_frags(OVPN_HEAD_ROOM, batch_len,
-				       SKB_FRAG_PAGE_ORDER, &ret, GFP_ATOMIC);
+	gso_skb = ovpn_gso_alloc(first_segment, 0, batch_len);
 	if (unlikely(!gso_skb))
 		return NULL;
 
-	skb_reserve(gso_skb, OVPN_HEAD_ROOM);
-	gso_skb->len = batch_len;
-	gso_skb->data_len = batch_len;
-	gso_skb->priority = first_segment->priority;
-
-	/* Segments retain the originating socket so we keep its send-buffer
-	 * accounting active until the UDP GSO is transmitted. This also
-	 * preserves its cached TX queue.
-	 */
-	if (first_segment->sk && is_skb_wmem(first_segment))
-		skb_set_owner_w(gso_skb, first_segment->sk);
 	skb_copy_hash(gso_skb, first_segment);
 #ifdef CONFIG_XPS
 	/* keep the aggregate on the TX queue selected for the original flow
@@ -534,7 +578,7 @@ static void ovpn_send(struct ovpn_priv *ovpn, struct sk_buff *skb,
 }
 
 /* encrypt fixed-size input segments into one or more UDP GSO aggregates */
-static void ovpn_send_gso(struct sk_buff_head *skbs, struct ovpn_peer *peer)
+static void ovpn_send_udp_gso(struct sk_buff_head *skbs, struct ovpn_peer *peer)
 {
 	unsigned int max_segs = 1, seg_len, batch_len, segs;
 	struct sk_buff *batch;
@@ -571,8 +615,8 @@ static void ovpn_send_gso(struct sk_buff_head *skbs, struct ovpn_peer *peer)
 		if (unlikely(!batch))
 			return;
 
-		if (unlikely(!ovpn_encrypt_gso_queue(skbs, peer,
-						     batch, segs))) {
+		if (unlikely(!ovpn_encrypt_udp_gso_queue(skbs, peer,
+							 batch, segs))) {
 			kfree_skb(batch);
 			return;
 		}
@@ -597,6 +641,65 @@ static bool ovpn_peer_supports_udp_gso(struct ovpn_peer *peer)
 	return udp_gso;
 }
 
+/* The transmit stack validates GSO geometry, including DODGY inputs. Only
+ * check whether the wire format can represent this skb's offload semantics.
+ */
+static bool ovpn_tcp_gso_eligible(const struct sk_buff *skb,
+				  unsigned int *segments, unsigned int *hdr_len)
+{
+	const struct skb_shared_info *shinfo = skb_shinfo(skb);
+	unsigned int type = shinfo->gso_type & ~SKB_GSO_DODGY;
+	unsigned int payload_len;
+
+	if (skb->encapsulation || skb->len > OVPN_TCP_GSO_MAX_INNER ||
+	    skb->ip_summed != CHECKSUM_PARTIAL)
+		return false;
+
+	if (type != SKB_GSO_TCPV4 && type != SKB_GSO_TCPV6)
+		return false;
+
+	*hdr_len = skb_transport_offset(skb) + tcp_hdrlen(skb);
+	payload_len = skb->len - *hdr_len;
+	*segments = DIV_ROUND_UP(payload_len, shinfo->gso_size);
+
+	return true;
+}
+
+/* Returning false leaves the input owned by the segmentation fallback. */
+static bool ovpn_send_tcp_gso(struct ovpn_peer *peer, struct sk_buff *skb)
+{
+	struct ovpn_crypto_key_slot *ks;
+	unsigned int segments, hdr_len;
+	struct sk_buff *gso_skb;
+	int ret;
+
+	if (!ovpn_peer_uses_tcp(peer) ||
+	    !ovpn_tcp_gso_eligible(skb, &segments, &hdr_len))
+		return false;
+
+	gso_skb = ovpn_gso_alloc(skb, OVPN_DATA_V2_OVERHEAD, skb->len);
+	if (unlikely(!gso_skb))
+		return false;
+
+	ks = ovpn_encrypt_prepare(peer, gso_skb, segments);
+	if (unlikely(!ks)) {
+		kfree_skb(gso_skb);
+		return false;
+	}
+
+	/* Account the same inner bytes as software segmentation, including
+	 * replicated IP/TCP headers. The link path counts ciphertext bytes.
+	 */
+	ovpn_peer_stats_add_tx(&peer->vpn_stats,
+			       skb->len + (segments - 1) * hdr_len, segments);
+
+	memset(ovpn_skb_cb(skb), 0, sizeof(struct ovpn_cb));
+	ovpn_skb_cb(skb)->tcp_gso = gso_skb;
+	ret = ovpn_aead_encrypt_tcp_gso(peer, ks, skb, gso_skb);
+	ovpn_encrypt_tcp_gso_post(skb, ret);
+	return true;
+}
+
 /* Send user data to the network
  */
 netdev_tx_t ovpn_net_xmit(struct sk_buff *skb, struct net_device *dev)
@@ -611,6 +714,15 @@ netdev_tx_t ovpn_net_xmit(struct sk_buff *skb, struct net_device *dev)
 	bool gso_out;
 	__be16 proto;
 	int ret;
+
+	/* Make skb metadata private before modifying it or acquiring TX refs.
+	 * Packet data can remain shared for out-of-place encryption.
+	 */
+	skb = skb_share_check(skb, GFP_ATOMIC);
+	if (unlikely(!skb)) {
+		ovpn_dev_dstats_tx_dropped(dev, 1);
+		return NETDEV_TX_OK;
+	}
 
 	/* A frag-list GSO skb already stores complete segments as child skbs.
 	 * Keep those children on the ordinary in-place encryption path instead
@@ -650,6 +762,14 @@ netdev_tx_t ovpn_net_xmit(struct sk_buff *skb, struct net_device *dev)
 	}
 	/* dst was needed for peer selection - it can now be dropped */
 	skb_dst_drop(skb);
+
+	/* if this is an eligible GSO skb and we're using TCP as transport
+	 * protocol, try to send it without prior segmentation
+	 */
+	if (gso_in && ovpn_send_tcp_gso(peer, skb)) {
+		ovpn_peer_put(peer);
+		return NETDEV_TX_OK;
+	}
 
 	if (gso_in) {
 		/* force software segmentation and calculate each checksum
@@ -713,7 +833,7 @@ netdev_tx_t ovpn_net_xmit(struct sk_buff *skb, struct net_device *dev)
 
 	if (gso_out && skb_queue_len(&skb_list) > 1 &&
 	    ovpn_peer_supports_udp_gso(peer))
-		ovpn_send_gso(&skb_list, peer);
+		ovpn_send_udp_gso(&skb_list, peer);
 
 	skb_list.prev->next = NULL;
 	ovpn_send(ovpn, skb_list.next, peer);

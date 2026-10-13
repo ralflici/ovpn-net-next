@@ -43,6 +43,24 @@
 #define OVPN_AAD_SIZE			(OVPN_OPCODE_SIZE + \
 					 OVPN_NONCE_WIRE_SIZE)
 #define OVPN_DATA_V2_OVERHEAD		(OVPN_AAD_SIZE + OVPN_AUTH_TAG_SIZE)
+
+/* Experimental negotiated TCP framing, also used for ordinary/control
+ * records. len counts everything after itself, including gso_size. A zero
+ * gso_size denotes an ordinary record; otherwise it is the inner TCP payload
+ * size per segment, with the inner checksum retaining its partial seed.
+ * DATA_V2 authenticates this prefix followed by its usual opcode/packet ID.
+ * This TX-only prototype assumes the framing has already been negotiated.
+ */
+struct ovpn_tcp_hdr {
+	__be16 len;
+	__be16 gso_size;
+};
+
+#define OVPN_TCP_AAD_SIZE		(sizeof(struct ovpn_tcp_hdr) + OVPN_AAD_SIZE)
+#define OVPN_TCP_MAX_RECORD	(U16_MAX - sizeof_field(struct ovpn_tcp_hdr, \
+							gso_size))
+#define OVPN_TCP_GSO_MAX_INNER	(OVPN_TCP_MAX_RECORD - OVPN_DATA_V2_OVERHEAD)
+
 #define OVPN_OPCODE_KEYID_MASK		0x07000000
 #define OVPN_OPCODE_PKTTYPE_MASK	0xF8000000
 #define OVPN_OPCODE_PEERID_MASK		0x00FFFFFF
