@@ -25,19 +25,22 @@
  *		containing the IV, the scatter gather list and the aead request
  * @peer: peer used by this crypto operation or owned by this aggregate
  * @ks: crypto key slot used by this operation or owned by this aggregate
+ * @tcp_packets: packet count for TCP output, one for ordinary TCP, zero for UDP
  * @payload_offset: offset in the skb where the payload starts
  * @nosignal: whether this skb should be sent with the MSG_NOSIGNAL flag (TCP)
  * @batch: UDP GSO aggregate receiving this input skb's encrypted payload
+ * @tcp_gso: output skb owned by a single TCP GSO encryption request
  * @batch_state: completion state owned by a UDP GSO aggregate
  */
 struct ovpn_cb {
 	void *crypto_tmp;
 	struct ovpn_peer *peer;
 	struct ovpn_crypto_key_slot *ks;
+	unsigned int tcp_packets;
 
-	/* Ordinary encryption leaves this union zeroed. Decryption and TCP use
-	 * their ordinary fields, a UDP GSO input stores its output aggregate,
-	 * and that aggregate uses the same space to coordinate its completions.
+	/* Ordinary encryption leaves this union zeroed. A GSO input stores its
+	 * output skb; UDP outputs use the same space to coordinate completions.
+	 * Decryption and TCP sending use their ordinary fields.
 	 */
 	union {
 		struct {
@@ -45,6 +48,7 @@ struct ovpn_cb {
 			bool nosignal;
 		};
 		struct sk_buff *batch;
+		struct sk_buff *tcp_gso;
 		struct {
 			atomic_t pending;
 			atomic_t failed;

@@ -43,6 +43,7 @@ void ovpn_xmit_special(struct ovpn_peer *peer, const void *data,
 		       const unsigned int len);
 
 void ovpn_encrypt_post(void *data, int ret);
+void ovpn_encrypt_tcp_gso_post(void *data, int ret);
 void ovpn_decrypt_post(void *data, int ret);
 
 #endif /* _NET_OVPN_OVPN_H_ */
