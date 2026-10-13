@@ -439,16 +439,17 @@ int ovpn_aead_encrypt_tcp_gso(struct ovpn_peer *peer,
 }
 
 int ovpn_aead_decrypt(struct ovpn_peer *peer, struct ovpn_crypto_key_slot *ks,
-		      struct sk_buff *skb)
+		      struct sk_buff *skb, bool tcp)
 {
 	const unsigned int tag_size = crypto_aead_authsize(ks->decrypt);
+	unsigned int aad_len = OVPN_AAD_SIZE;
 	int ret, payload_len, nfrags;
 	unsigned int payload_offset;
 	struct aead_request *req;
 	struct sk_buff *trailer;
 	struct scatterlist *sg;
 	void *tmp;
-	u8 *iv;
+	u8 *aad, *iv;
 
 	payload_offset = OVPN_AAD_SIZE + tag_size;
 	payload_len = skb->len - payload_offset;
@@ -489,14 +490,25 @@ int ovpn_aead_decrypt(struct ovpn_peer *peer, struct ovpn_crypto_key_slot *ks,
 	sg = ovpn_aead_crypto_req_sg(ks->decrypt, req);
 
 	/* sg table:
-	 * 0: op, wire nonce (AD, len=OVPN_OPCODE_SIZE+OVPN_NONCE_WIRE_SIZE),
+	 * 0: optional TCP prefix, op, wire nonce (AD),
 	 * 1, 2, 3, ..., n: payload,
 	 * n+1: auth_tag (len=tag_size)
 	 */
 	sg_init_table(sg, nfrags + 2);
 
-	/* packet op is head of additional data */
-	sg_set_buf(sg, skb->data, OVPN_AAD_SIZE);
+	/* TCP framing is contiguous with the opcode and packet ID. Save its
+	 * segment size, but do not use it until authentication succeeds.
+	 */
+	aad = skb->data;
+	if (tcp) {
+		const struct ovpn_tcp_hdr *hdr;
+
+		aad -= sizeof(*hdr);
+		hdr = (const struct ovpn_tcp_hdr *)aad;
+		aad_len = OVPN_TCP_AAD_SIZE;
+		ovpn_skb_cb(skb)->gso_size = ntohs(hdr->gso_size);
+	}
+	sg_set_buf(sg, aad, aad_len);
 
 	/* build scatterlist to decrypt packet payload */
 	ret = skb_to_sgvec_nomark(skb, sg + 1, payload_offset, payload_len);
@@ -519,7 +531,7 @@ int ovpn_aead_decrypt(struct ovpn_peer *peer, struct ovpn_crypto_key_slot *ks,
 	aead_request_set_callback(req, 0, ovpn_decrypt_post, skb);
 	aead_request_set_crypt(req, sg, sg, payload_len + tag_size, iv);
 
-	aead_request_set_ad(req, OVPN_AAD_SIZE);
+	aead_request_set_ad(req, aad_len);
 
 	/* decrypt it */
 	return crypto_aead_decrypt(req);

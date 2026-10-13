@@ -49,7 +49,7 @@
  * gso_size denotes an ordinary record; otherwise it is the inner TCP payload
  * size per segment, with the inner checksum retaining its partial seed.
  * DATA_V2 authenticates this prefix followed by its usual opcode/packet ID.
- * This TX-only prototype assumes the framing has already been negotiated.
+ * This prototype assumes the framing has already been negotiated.
  */
 struct ovpn_tcp_hdr {
 	__be16 len;
