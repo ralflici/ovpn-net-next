@@ -332,21 +332,30 @@ void ovpn_recv_tcp(struct ovpn_peer *peer, struct sk_buff *source,
 {
 	const unsigned int prefix_len = sizeof(struct ovpn_tcp_hdr);
 	const unsigned int header_len = prefix_len + OVPN_DATA_V2_OVERHEAD;
+	unsigned int head_len, data_len;
 	struct sk_buff *skb;
+	int ret;
 
 	if (unlikely(len < header_len || offset > source->len ||
 		     len > source->len - offset))
 		goto drop;
 
-	/* Preserve the existing linear allocation and prefix headroom. Only
-	 * framing, opcode, packet ID and tag are copied before decryption.
+	/* Decrypt the first 128 inner bytes into the head for IP/TCP parsing.
+	 * Longer headers can still be pulled after authentication. Put the
+	 * remaining plaintext in order-0 pages instead of a large allocation.
 	 */
-	skb = netdev_alloc_skb(peer->ovpn->dev, len);
+	head_len = min_t(unsigned int, len, header_len + 128);
+	data_len = len - head_len;
+	skb = alloc_skb_with_frags(NET_SKB_PAD + head_len, data_len, 0,
+				   &ret, GFP_ATOMIC);
 	if (unlikely(!skb))
 		goto drop;
+	skb_reserve(skb, NET_SKB_PAD);
+	skb_put(skb, head_len);
+	skb->len += data_len;
+	skb->data_len = data_len;
 	skb_copy_header(skb, source);
-	if (unlikely(skb_copy_bits(source, offset, skb_put(skb, len),
-				   header_len))) {
+	if (unlikely(skb_copy_bits(source, offset, skb->data, header_len))) {
 		kfree_skb(skb);
 		goto drop;
 	}

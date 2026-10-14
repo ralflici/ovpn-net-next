@@ -544,6 +544,7 @@ int ovpn_aead_decrypt_tcp(struct ovpn_peer *peer,
 	const unsigned int tag_size = crypto_aead_authsize(ks->decrypt);
 	const unsigned int payload_offset = OVPN_AAD_SIZE + tag_size;
 	const unsigned int payload_len = skb->len - payload_offset;
+	const unsigned int dst_nents = skb_shinfo(skb)->nr_frags + 2;
 	const struct ovpn_tcp_hdr *hdr;
 	struct scatterlist *src, *dst;
 	struct aead_request *req;
@@ -564,6 +565,9 @@ int ovpn_aead_decrypt_tcp(struct ovpn_peer *peer,
 	 */
 	nents = ovpn_skb_nsg(source, 0);
 	if (unlikely(nents < 0)) {
+		ret = skb_linearize(skb);
+		if (ret)
+			return ret;
 		ret = skb_copy_bits(source, offset + payload_offset,
 				    skb->data + payload_offset, payload_len);
 		if (ret)
@@ -571,7 +575,8 @@ int ovpn_aead_decrypt_tcp(struct ovpn_peer *peer,
 		return ovpn_aead_decrypt(peer, ks, skb, true);
 	}
 
-	req = ovpn_aead_request_alloc(ks->decrypt, skb, nents + 4, 0, &iv);
+	req = ovpn_aead_request_alloc(ks->decrypt, skb, nents + 2 + dst_nents,
+				      0, &iv);
 	if (IS_ERR(req))
 		return PTR_ERR(req);
 	src = ovpn_aead_crypto_req_sg(ks->decrypt, req);
@@ -591,10 +596,16 @@ int ovpn_aead_decrypt_tcp(struct ovpn_peer *peer,
 	sg_set_buf(src + mapped + 1, skb->data + OVPN_AAD_SIZE, tag_size);
 	sg_mark_end(src + mapped + 1);
 
-	sg_init_table(dst, payload_len ? 2 : 1);
+	sg_init_table(dst, dst_nents);
 	sg_set_buf(dst, aad, OVPN_TCP_AAD_SIZE);
-	if (payload_len)
-		sg_set_buf(dst + 1, skb->data + payload_offset, payload_len);
+	mapped = 0;
+	if (payload_len) {
+		mapped = skb_to_sgvec_nomark(skb, dst + 1, payload_offset,
+					     payload_len);
+		if (unlikely(mapped < 0))
+			return mapped;
+	}
+	sg_mark_end(dst + mapped);
 
 	memcpy(iv, skb->data + OVPN_OPCODE_SIZE, OVPN_NONCE_WIRE_SIZE);
 	memcpy(iv + OVPN_NONCE_WIRE_SIZE, ks->nonce_tail_recv,
