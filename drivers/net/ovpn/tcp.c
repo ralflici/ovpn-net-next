@@ -103,6 +103,7 @@ static void ovpn_tcp_rcv(struct strparser *strp, struct sk_buff *skb)
 	struct strp_msg *msg = strp_msg(skb);
 	struct ovpn_tcp_hdr hdr;
 	int pkt_len = msg->full_len - sizeof(hdr);
+	__be32 op;
 	u8 opcode;
 
 	/* we need at least 4 bytes of data in the packet
@@ -117,14 +118,11 @@ static void ovpn_tcp_rcv(struct strparser *strp, struct sk_buff *skb)
 	if (skb_copy_bits(skb, msg->offset, &hdr, sizeof(hdr)))
 		goto err;
 
-	/* Keep the prefix in headroom for DATA_V2 authentication. */
-	skb = ovpn_tcp_skb_packet(peer, skb, msg->full_len, msg->offset);
-	if (unlikely(!skb))
+	if (skb_copy_bits(skb, msg->offset + sizeof(hdr), &op, sizeof(op)))
 		goto err;
-	__skb_pull(skb, sizeof(hdr));
 
 	/* DATA_V2 packets are handled in kernel, the rest goes to user space */
-	opcode = ovpn_opcode_from_skb(skb, 0);
+	opcode = FIELD_GET(OVPN_OPCODE_PKTTYPE_MASK, be32_to_cpu(op));
 	if (unlikely(opcode != OVPN_DATA_V2)) {
 		if (hdr.gso_size)
 			goto err;
@@ -135,6 +133,11 @@ static void ovpn_tcp_rcv(struct strparser *strp, struct sk_buff *skb)
 			goto err;
 		}
 
+		skb = ovpn_tcp_skb_packet(peer, skb, msg->full_len, msg->offset);
+		if (unlikely(!skb))
+			goto err;
+		__skb_pull(skb, sizeof(hdr));
+
 		/* Preserve userspace's two-byte control-record prefix. pkt_len
 		 * excludes the GSO field that was present on the wire.
 		 */
@@ -143,7 +146,7 @@ static void ovpn_tcp_rcv(struct strparser *strp, struct sk_buff *skb)
 		return;
 	}
 
-	/* hold reference to peer as required by ovpn_recv().
+	/* hold reference to peer as required by ovpn_recv_tcp().
 	 *
 	 * NOTE: in this context we should already be holding a reference to
 	 * this peer, therefore ovpn_peer_hold() is not expected to fail
@@ -151,7 +154,7 @@ static void ovpn_tcp_rcv(struct strparser *strp, struct sk_buff *skb)
 	if (WARN_ON(!ovpn_peer_hold(peer)))
 		goto err_nopeer;
 
-	ovpn_recv(peer, skb, true);
+	ovpn_recv_tcp(peer, skb, msg->offset, msg->full_len);
 	return;
 err:
 	/* take reference for deferred peer deletion. should never fail */

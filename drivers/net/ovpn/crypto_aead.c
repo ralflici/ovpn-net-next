@@ -537,6 +537,77 @@ int ovpn_aead_decrypt(struct ovpn_peer *peer, struct ovpn_crypto_key_slot *ks,
 	return crypto_aead_decrypt(req);
 }
 
+int ovpn_aead_decrypt_tcp(struct ovpn_peer *peer,
+			  struct ovpn_crypto_key_slot *ks, struct sk_buff *skb,
+			  struct sk_buff *source, unsigned int offset)
+{
+	const unsigned int tag_size = crypto_aead_authsize(ks->decrypt);
+	const unsigned int payload_offset = OVPN_AAD_SIZE + tag_size;
+	const unsigned int payload_len = skb->len - payload_offset;
+	const struct ovpn_tcp_hdr *hdr;
+	struct scatterlist *src, *dst;
+	struct aead_request *req;
+	int nents, mapped = 0, ret;
+	u8 *aad, *iv;
+
+	ovpn_skb_cb(skb)->payload_offset = payload_offset;
+	ovpn_skb_cb(skb)->peer = peer;
+	ovpn_skb_cb(skb)->ks = ks;
+
+	aad = skb->data - sizeof(*hdr);
+	hdr = (const struct ovpn_tcp_hdr *)aad;
+	ovpn_skb_cb(skb)->gso_size = ntohs(hdr->gso_size);
+
+	/* The source can contain parts of adjacent records. Counting all its
+	 * storage bounds the SG, but map only this record's ciphertext range.
+	 * Keep the copy path for shapes beyond the SG mapper's nesting limit.
+	 */
+	nents = ovpn_skb_nsg(source, 0);
+	if (unlikely(nents < 0)) {
+		ret = skb_copy_bits(source, offset + payload_offset,
+				    skb->data + payload_offset, payload_len);
+		if (ret)
+			return ret;
+		return ovpn_aead_decrypt(peer, ks, skb, true);
+	}
+
+	req = ovpn_aead_request_alloc(ks->decrypt, skb, nents + 4, 0, &iv);
+	if (IS_ERR(req))
+		return PTR_ERR(req);
+	src = ovpn_aead_crypto_req_sg(ks->decrypt, req);
+	dst = src + nents + 2;
+
+	/* AEAD reads AAD, ciphertext, tag. The small header and tag are already
+	 * private; ciphertext stays read-only in the retained stream skb.
+	 */
+	sg_init_table(src, nents + 2);
+	sg_set_buf(src, aad, OVPN_TCP_AAD_SIZE);
+	if (payload_len) {
+		mapped = skb_to_sgvec_nomark(source, src + 1,
+					     offset + payload_offset, payload_len);
+		if (unlikely(mapped < 0))
+			return mapped;
+	}
+	sg_set_buf(src + mapped + 1, skb->data + OVPN_AAD_SIZE, tag_size);
+	sg_mark_end(src + mapped + 1);
+
+	sg_init_table(dst, payload_len ? 2 : 1);
+	sg_set_buf(dst, aad, OVPN_TCP_AAD_SIZE);
+	if (payload_len)
+		sg_set_buf(dst + 1, skb->data + payload_offset, payload_len);
+
+	memcpy(iv, skb->data + OVPN_OPCODE_SIZE, OVPN_NONCE_WIRE_SIZE);
+	memcpy(iv + OVPN_NONCE_WIRE_SIZE, ks->nonce_tail_recv,
+	       OVPN_NONCE_TAIL_SIZE);
+
+	aead_request_set_tfm(req, ks->decrypt);
+	aead_request_set_callback(req, 0, ovpn_decrypt_post, skb);
+	aead_request_set_crypt(req, src, dst, payload_len + tag_size, iv);
+	aead_request_set_ad(req, OVPN_TCP_AAD_SIZE);
+
+	return crypto_aead_decrypt(req);
+}
+
 /* Initialize a struct crypto_aead object */
 static struct crypto_aead *ovpn_aead_init(const char *title,
 					  const char *alg_name,

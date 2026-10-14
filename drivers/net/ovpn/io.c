@@ -192,6 +192,7 @@ void ovpn_decrypt_post(void *data, int ret)
 	peer = ovpn_skb_cb(skb)->peer;
 
 	/* crypto is done, cleanup skb CB and its members */
+	consume_skb(ovpn_skb_cb(skb)->decrypt_src);
 	kfree(ovpn_skb_cb(skb)->crypto_tmp);
 
 	if (unlikely(ret < 0))
@@ -288,10 +289,12 @@ drop_nocount:
 }
 
 /* RX path entry point: decrypt packet and forward it to the device */
-void ovpn_recv(struct ovpn_peer *peer, struct sk_buff *skb, bool tcp)
+static void ovpn_recv_skb(struct ovpn_peer *peer, struct sk_buff *skb, bool tcp,
+			  struct sk_buff *source, unsigned int offset)
 {
 	struct ovpn_crypto_key_slot *ks;
 	u8 key_id;
+	int ret;
 
 	ovpn_peer_stats_increment_rx(&peer->link_stats, skb->len);
 
@@ -303,13 +306,58 @@ void ovpn_recv(struct ovpn_peer *peer, struct sk_buff *skb, bool tcp)
 				     netdev_name(peer->ovpn->dev), peer->id,
 				     key_id);
 		ovpn_dev_dstats_rx_dropped(peer->ovpn->dev);
+		kfree_skb(source);
 		kfree_skb(skb);
 		ovpn_peer_put(peer);
 		return;
 	}
 
 	memset(ovpn_skb_cb(skb), 0, sizeof(struct ovpn_cb));
-	ovpn_decrypt_post(skb, ovpn_aead_decrypt(peer, ks, skb, tcp));
+	ovpn_skb_cb(skb)->decrypt_src = source;
+	if (source)
+		ret = ovpn_aead_decrypt_tcp(peer, ks, skb, source, offset);
+	else
+		ret = ovpn_aead_decrypt(peer, ks, skb, tcp);
+	ovpn_decrypt_post(skb, ret);
+}
+
+void ovpn_recv(struct ovpn_peer *peer, struct sk_buff *skb, bool tcp)
+{
+	ovpn_recv_skb(peer, skb, tcp, NULL, 0);
+}
+
+/* Consume the stream skb and peer reference, including on failure. */
+void ovpn_recv_tcp(struct ovpn_peer *peer, struct sk_buff *source,
+		   unsigned int offset, unsigned int len)
+{
+	const unsigned int prefix_len = sizeof(struct ovpn_tcp_hdr);
+	const unsigned int header_len = prefix_len + OVPN_DATA_V2_OVERHEAD;
+	struct sk_buff *skb;
+
+	if (unlikely(len < header_len || offset > source->len ||
+		     len > source->len - offset))
+		goto drop;
+
+	/* Preserve the existing linear allocation and prefix headroom. Only
+	 * framing, opcode, packet ID and tag are copied before decryption.
+	 */
+	skb = netdev_alloc_skb(peer->ovpn->dev, len);
+	if (unlikely(!skb))
+		goto drop;
+	skb_copy_header(skb, source);
+	if (unlikely(skb_copy_bits(source, offset, skb_put(skb, len),
+				   header_len))) {
+		kfree_skb(skb);
+		goto drop;
+	}
+	__skb_pull(skb, prefix_len);
+
+	ovpn_recv_skb(peer, skb, true, source, offset + prefix_len);
+	return;
+drop:
+	ovpn_dev_dstats_rx_dropped(peer->ovpn->dev);
+	kfree_skb(source);
+	ovpn_peer_put(peer);
 }
 
 static void ovpn_encrypt_key_exhausted(struct ovpn_peer *peer,

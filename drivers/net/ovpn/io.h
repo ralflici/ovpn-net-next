@@ -39,6 +39,8 @@ static inline void ovpn_skb_prefetchw_linear(const struct sk_buff *skb)
 netdev_tx_t ovpn_net_xmit(struct sk_buff *skb, struct net_device *dev);
 
 void ovpn_recv(struct ovpn_peer *peer, struct sk_buff *skb, bool tcp);
+void ovpn_recv_tcp(struct ovpn_peer *peer, struct sk_buff *source,
+		   unsigned int offset, unsigned int len);
 void ovpn_xmit_special(struct ovpn_peer *peer, const void *data,
 		       const unsigned int len);
 
