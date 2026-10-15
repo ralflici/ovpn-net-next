@@ -9,6 +9,7 @@
 
 #include <crypto/aead.h>
 #include <linux/netdevice.h>
+#include <linux/prefetch.h>
 #include <linux/skbuff.h>
 #include <net/gro_cells.h>
 #include <net/gso.h>
@@ -326,6 +327,73 @@ void ovpn_recv(struct ovpn_peer *peer, struct sk_buff *skb, bool tcp)
 	ovpn_recv_skb(peer, skb, tcp, NULL, 0);
 }
 
+static void ovpn_prefetch_range(const void *data, unsigned int len)
+{
+	unsigned long addr = (unsigned long)data;
+	unsigned long end = addr + len;
+
+	for (; addr < end; addr = ALIGN(addr + 1, L1_CACHE_BYTES))
+		prefetch((const void *)addr);
+}
+
+/* Walk only this record's ciphertext, including nested GRO frag lists.
+ * Match the SG mapper's nesting limit and skip storage without a direct map.
+ */
+static void ovpn_skb_prefetch_data(const struct sk_buff *skb,
+				   unsigned int offset, unsigned int len,
+				   unsigned int depth)
+{
+	unsigned int size = skb_headlen(skb), chunk;
+	const struct sk_buff *child;
+	int i;
+
+	if (!len || unlikely(depth >= 24))
+		return;
+
+	if (offset < size) {
+		chunk = min(len, size - offset);
+		ovpn_prefetch_range(skb->data + offset, chunk);
+		len -= chunk;
+		offset = 0;
+	} else {
+		offset -= size;
+	}
+	if (!len)
+		return;
+
+	for (i = 0; i < skb_shinfo(skb)->nr_frags; i++) {
+		const skb_frag_t *frag = &skb_shinfo(skb)->frags[i];
+		const void *data;
+
+		size = skb_frag_size(frag);
+		if (offset >= size) {
+			offset -= size;
+			continue;
+		}
+		chunk = min(len, size - offset);
+		data = skb_frag_address_safe(frag);
+		if (data)
+			ovpn_prefetch_range(data + offset, chunk);
+		len -= chunk;
+		offset = 0;
+		if (!len)
+			return;
+	}
+
+	skb_walk_frags(skb, child) {
+		if (offset >= child->len) {
+			offset -= child->len;
+			continue;
+		}
+		chunk = min(len, child->len - offset);
+		ovpn_skb_prefetch_data(child, offset, chunk, depth + 1);
+		len -= chunk;
+		offset = 0;
+		if (!len)
+			return;
+	}
+}
+
 /* Consume the stream skb and peer reference, including on failure. */
 void ovpn_recv_tcp(struct ovpn_peer *peer, struct sk_buff *source,
 		   unsigned int offset, unsigned int len)
@@ -339,6 +407,9 @@ void ovpn_recv_tcp(struct ovpn_peer *peer, struct sk_buff *source,
 	if (unlikely(len < header_len || offset > source->len ||
 		     len > source->len - offset))
 		goto drop;
+
+	/* Give source reads a head start while allocating the private output. */
+	ovpn_skb_prefetch_data(source, offset + header_len, len - header_len, 0);
 
 	/* Decrypt the first 128 inner bytes into the head for IP/TCP parsing.
 	 * Longer headers can still be pulled after authentication. Put the
